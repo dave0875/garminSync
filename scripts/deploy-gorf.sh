@@ -3,7 +3,11 @@
 # This intentionally never invokes rclone against the watch.
 set -euo pipefail
 
-repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+repo_root="$(
+  unset CDPATH
+  cd -- "$(dirname -- "$0")/.."
+  pwd
+)"
 target_root="$HOME/.local/bin/garmin-sync"
 target_bin="$HOME/.local/bin"
 target_unit="$HOME/.config/systemd/user/garmin-sync.service"
@@ -120,7 +124,8 @@ fi
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 backup="$retired_root/deploy-$stamp"
-mkdir -p -m 700 "$backup"
+mkdir -p -- "$backup"
+chmod 0700 "$backup"
 
 backup_if_present() {
   local source="$1" name
@@ -174,7 +179,8 @@ rollback() {
     fi
     for saved in "$backup"/legacy-*.desktop; do
       [[ -e "$saved" ]] || continue
-      mkdir -p -m 700 "$autostart_dir"
+      mkdir -p -- "$autostart_dir"
+      chmod 0700 "$autostart_dir"
       cp -p -- "$saved" "$autostart_dir/${saved##*/legacy-}"
     done
     /usr/bin/systemctl --user daemon-reload
