@@ -1,0 +1,4 @@
+# Official Garmin FIT Python SDK. This project intentionally has no Garmin
+# Connect client, browser automation, or cloud-scraping dependency.
+garmin-fit-sdk==21.214.0
+

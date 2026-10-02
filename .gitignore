@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.coverage
+build/
+dist/
+
+evidence/
+state/
+garmin-retired/
+*.log
+

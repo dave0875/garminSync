@@ -1,0 +1,59 @@
+name: CI/CD
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: Type DEPLOY_GORF to deploy the selected main revision
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y rclone
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Static checks
+        run: |
+          set -euo pipefail
+          python -m py_compile garmin_sync.py garmin_fit_inspect.py tests/test_sync.py
+          bash -n bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh
+          ! rg -in 'garth|garminconnect|garmin_cloud_sync|garmin-browser-auth|connectapi[.]garmin|sso[.]garmin|CloudMetrics|[.]garth' garmin_sync.py garmin_fit_inspect.py bin systemd scripts
+      - name: Regression tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m unittest discover -s tests -v
+
+  deploy:
+    needs: test
+    if: >-
+      github.repository == 'dave0875/garminSync' &&
+      (github.event_name == 'push' || inputs.confirm == 'DEPLOY_GORF')
+    runs-on: [self-hosted, Linux, X64, gorf, garmin-sync]
+    timeout-minutes: 15
+    concurrency:
+      group: garmin-sync-gorf-deployment
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Deploy tested native-only implementation
+        run: scripts/deploy-gorf.sh

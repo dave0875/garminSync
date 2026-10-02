@@ -1,0 +1,19 @@
+[Unit]
+Description=Native fenix 8 device backup
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/bin/garmin-sync/garmin_sync.py daemon
+Restart=on-failure
+RestartSec=5
+RuntimeDirectory=garmin-sync
+RuntimeDirectoryMode=0700
+UMask=0077
+KillMode=control-group
+TimeoutStopSec=30
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec /usr/bin/python3 "$HOME/.local/bin/garmin-sync/garmin_sync.py" "$@"
+
