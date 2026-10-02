@@ -1,7 +1,11 @@
 #!/usr/bin/python3
 """Controller regressions and rclone fixtures, using only temporary local backups."""
+import json
 import os
 from pathlib import Path
+import struct
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -149,17 +153,63 @@ class BasicTests(unittest.TestCase):
             self.assertIsNotNone(sync.model_at(root))
             xml.write_text("<bad")
             self.assertIsNone(sync.model_at(root))
+            xml.write_text(XML.replace("<Id>fixture</Id>", ""))
+            self.assertIsNone(sync.model_at(root))
     def test_uri_only_mtp_removal_and_absent_once(self):
         mount = mock.Mock()
         mount.get_root.return_value.get_path.return_value = None
         mount.get_root.return_value.get_uri.return_value = "mtp:" + "//fixture/"
-        self.assertTrue(sync.mount_matches_source(mount, "/run/user/1000/gvfs/mtp:host=fixture/Internal Storage/GARMIN"))
+        self.assertTrue(sync.mount_matches_source(
+            mount, "/run/user/1000/gvfs/mtp:host=fixture/Internal Storage/GARMIN"))
+        self.assertFalse(sync.mount_matches_source(
+            mount, "/run/user/1000/gvfs/mtp:host=phone/Internal Storage/GARMIN"))
         self.assertFalse(sync.mount_matches_source(mount, "/media/user/watch/GARMIN"))
         mount.get_root.return_value.get_uri.return_value = "gphoto2:" + "//fixture/"
-        self.assertTrue(sync.mount_matches_source(mount, "/run/user/1000/gvfs/gphoto2:host=fixture/GARMIN"))
-        self.assertFalse(sync.mount_matches_source(mount, "/run/user/1000/gvfs/mtp:host=fixture/Internal Storage/GARMIN"))
-        with mock.patch.object(sync, "discover", return_value=None):
+        self.assertTrue(sync.mount_matches_source(
+            mount, "/run/user/1000/gvfs/gphoto2:host=fixture/GARMIN"))
+        self.assertFalse(sync.mount_matches_source(
+            mount, "/run/user/1000/gvfs/mtp:host=fixture/Internal Storage/GARMIN"))
+        with mock.patch.object(sync, "enrolled_device", return_value={"identity": "a" * 64}), \
+             mock.patch.object(sync, "discover", return_value=None):
             self.assertEqual(sync.once(None, "dry-run"), 2)
+
+    def test_discovery_requires_unique_or_enrolled_identity(self):
+        with tempfile.TemporaryDirectory() as name:
+            first, second = Path(name) / "one", Path(name) / "two"
+            for base, identity in ((first, "fixture"), (second, "another")):
+                root = base / "GARMIN"
+                root.mkdir(parents=True)
+                root.joinpath("GarminDevice.xml").write_text(XML.replace("fixture", identity))
+            first_device = sync.model_at(first / "GARMIN")
+            with self.assertRaises(sync.DiscoveryError):
+                sync.discover([str(first), str(second)], uid=9999, username="fixture")
+            with self.assertRaises(sync.DiscoveryError):
+                sync.discover([str(first), str(second)], uid=9999, username="fixture",
+                              expected_identity=first_device["identity"])
+            found = sync.discover([str(first)], uid=9999, username="fixture",
+                                  expected_identity=first_device["identity"])
+            self.assertEqual(found["root"], str(first / "GARMIN"))
+            with self.assertRaisesRegex(sync.DiscoveryError, "not the enrolled"):
+                sync.discover([str(second)], uid=9999, username="fixture",
+                              expected_identity=first_device["identity"])
+
+    def test_enrollment_is_private_and_once_refuses_unenrolled(self):
+        with tempfile.TemporaryDirectory() as name:
+            pin = Path(name) / "config" / "device.json"
+            saved = sync.save_enrollment(
+                {"identity": "a" * 64, "model": "fenix 8", "root": "/fixture"}, pin)
+            self.assertEqual(saved["identity"], "a" * 64)
+            self.assertEqual(sync.enrolled_device(pin)["identity"], "a" * 64)
+            self.assertEqual(pin.stat().st_mode & 0o777, 0o600)
+        with mock.patch.object(sync, "enrolled_device", return_value=None):
+            self.assertEqual(sync.once(None, "verify"), 3)
+
+    def test_verify_obeys_process_lock(self):
+        class AlwaysBusy:
+            def __enter__(self): raise sync.Busy("fixture")
+            def __exit__(self, *_): return False
+        with mock.patch.object(sync, "RunLocks", return_value=AlwaysBusy()):
+            self.assertEqual(sync.main(["verify"]), 75)
     def test_state_atomic_preserves_last_success(self):
         with tempfile.TemporaryDirectory() as name:
             path = Path(name) / "state.json"
@@ -168,6 +218,44 @@ class BasicTests(unittest.TestCase):
             state.update(status="failed")
             self.assertEqual(sync.State(path).snapshot()["last_success"], "previous")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+    def test_conflicting_autostarts_detects_renamed_legacy_launcher(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            root.joinpath("unrelated.desktop").write_text(
+                "[Desktop Entry]\nExec=/usr/bin/true\n")
+            root.joinpath("renamed.desktop").write_text(
+                "[Desktop Entry]\nExec=/home/user/.local/bin/garmin_autodev_sync.sh\n")
+            conflicts = sync.conflicting_autostarts(root)
+            self.assertEqual(conflicts, [str(root / "renamed.desktop")])
+
+    def test_readiness_rejects_stale_pid_and_wrong_build(self):
+        state = {"daemon_pid": 123, "status": "waiting", "build": {"commit": "abc"}}
+        service = {"ActiveState": "active", "MainPID": "123", "SubState": "running"}
+        with mock.patch.object(sync, "service_snapshot", return_value=service), \
+             mock.patch.object(sync, "State") as state_type, \
+             mock.patch.object(sync, "build_info", return_value={"commit": "abc"}), \
+             mock.patch.object(sync, "enrolled_device", return_value=None):
+            state_type.return_value.snapshot.return_value = state
+            ready, _ = sync.readiness("abc")
+            self.assertTrue(ready)
+            state_type.return_value.snapshot.return_value = {**state, "daemon_pid": 122}
+            ready, _ = sync.readiness("abc")
+            self.assertFalse(ready)
+            state_type.return_value.snapshot.return_value = state
+            with mock.patch.object(sync, "build_info", return_value={"commit": "older"}):
+                ready, _ = sync.readiness("abc")
+                self.assertFalse(ready)
+
+    def test_status_is_unhealthy_until_device_is_enrolled(self):
+        payload = {
+            "service": {"ActiveState": "active", "MainPID": "123"},
+            "state": {"status": "waiting"},
+            "build": {"commit": "abc"},
+            "enrollment": None,
+        }
+        with mock.patch.object(sync, "readiness", return_value=(True, payload)):
+            self.assertEqual(sync.main(["status"]), 1)
+
     def test_runner_cancellation_kills_stubborn_child_group(self):
         with tempfile.TemporaryDirectory() as name:
             runner, results = sync.Runner(), []
@@ -218,8 +306,11 @@ class LocalRcloneTests(unittest.TestCase):
         path.write_bytes(content)
         return path
     def run_sync(self, mode="copy", runner=None, inspect=False):
+        sdk_python = sync.SDK_PYTHON if sync.SDK_PYTHON.exists() else Path(sys.executable)
+        inspector = Path(sync.__file__).resolve().parent / "garmin_fit_inspect.py"
         return sync.SyncRun(self.state, runtime=self.base / "runtime", destination=str(self.destination),
-                            archive_base=str(self.archive), runner=runner, inspect=inspect).execute(str(self.source), mode)
+                            archive_base=str(self.archive), runner=runner, inspect=inspect,
+                            inspector=inspector, sdk_python=sdk_python).execute(str(self.source), mode)
     def test_selection_checksum_idempotence_archive_no_deletion(self):
         calls = []
         class RecordingRunner(sync.Runner):
@@ -314,7 +405,6 @@ class LocalRcloneTests(unittest.TestCase):
         with self.assertRaises((sync.CommandFailed, sync.Cancelled)):
             self.run_sync(runner=ReplacingRunner())
         self.assertIsNone(self.state.snapshot()["last_success"])
-    @unittest.skipUnless(sync.INSPECTOR.exists() and sync.SDK_PYTHON.exists(), "optional SDK absent")
     def test_bad_fit_warning_preserves_raw_bytes(self):
         result = self.run_sync(inspect=True)
         self.assertTrue(result["fit_warnings"])
@@ -323,5 +413,48 @@ class LocalRcloneTests(unittest.TestCase):
         self.assertFalse(warning["integrity_ok"])
         self.assertEqual((self.destination / "Activity/activity.fit").read_bytes(), b"native fixture bytes")
         self.assertEqual(result["verified"], 10)
+
+
+class FitInspectorTests(unittest.TestCase):
+    @staticmethod
+    def crc(data):
+        crc = 0
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0xA001 if crc & 1 else 0)
+        return crc & 0xFFFF
+
+    def minimal_fit(self):
+        # One file_id definition and one file_id data message (type=activity).
+        definition = bytes([0x40, 0x00, 0x00, 0x00, 0x00, 0x01,
+                            0x00, 0x01, 0x00])
+        data = bytes([0x00, 0x04])
+        body = definition + data
+        header12 = struct.pack("<BBHI4s", 14, 0x20, 100, len(body), b".FIT")
+        header = header12 + struct.pack("<H", self.crc(header12))
+        complete = header + body
+        return complete + struct.pack("<H", self.crc(complete))
+
+    def test_checkout_inspector_decodes_valid_and_rejects_corrupt_fit(self):
+        inspector = Path(sync.__file__).resolve().parent / "garmin_fit_inspect.py"
+        sdk_python = sync.SDK_PYTHON if sync.SDK_PYTHON.exists() else Path(sys.executable)
+        with tempfile.TemporaryDirectory() as name:
+            valid = Path(name) / "valid.fit"
+            bad = Path(name) / "bad.fit"
+            valid.write_bytes(self.minimal_fit())
+            bad.write_bytes(b"not a fit file")
+            good = subprocess.run([str(sdk_python), str(inspector), str(valid)],
+                                  capture_output=True, text=True)
+            self.assertEqual(good.returncode, 0, good.stderr + good.stdout)
+            decoded = json.loads(good.stdout)[0]
+            self.assertTrue(decoded["decode_ok"])
+            self.assertTrue(decoded["integrity_ok"])
+            broken = subprocess.run([str(sdk_python), str(inspector), str(bad)],
+                                    capture_output=True, text=True)
+            self.assertEqual(broken.returncode, 1)
+            rejected = json.loads(broken.stdout)[0]
+            self.assertFalse(rejected["decode_ok"])
+
 
 if __name__ == "__main__": unittest.main(verbosity=2)

@@ -3,7 +3,10 @@ name: CI/CD
 on:
   pull_request:
   push:
-    branches: [main]
+    branches:
+      - main
+      - 'feat/**'
+      - 'fix/**'
   workflow_dispatch:
     inputs:
       confirm:
@@ -19,15 +22,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install test dependencies
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y rclone
+          sudo apt-get install -y rclone ripgrep python3-gi shellcheck
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
       - name: Static checks
@@ -35,7 +38,13 @@ jobs:
           set -euo pipefail
           python -m py_compile garmin_sync.py garmin_fit_inspect.py tests/test_sync.py
           bash -n bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh
-          ! rg -in 'garth|garminconnect|garmin_cloud_sync|garmin-browser-auth|connectapi[.]garmin|sso[.]garmin|CloudMetrics|[.]garth' garmin_sync.py garmin_fit_inspect.py bin systemd scripts
+          shellcheck bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh
+          command -v rg >/dev/null
+          if rg -in 'garth|garminconnect|garmin_cloud_sync|garmin-browser-auth|connectapi[.]garmin|sso[.]garmin|CloudMetrics|[.]garth' garmin_sync.py garmin_fit_inspect.py bin systemd scripts; then
+            echo "Forbidden cloud-client reference detected" >&2
+            exit 1
+          fi
+          /usr/bin/python3 -c "import gi; gi.require_version('Gio','2.0'); from gi.repository import Gio"
       - name: Regression tests
         env:
           PYTHONPATH: ${{ github.workspace }}
@@ -45,6 +54,7 @@ jobs:
     needs: test
     if: >-
       github.repository == 'dave0875/garminSync' &&
+      github.ref == 'refs/heads/main' &&
       (github.event_name == 'push' || inputs.confirm == 'DEPLOY_GORF')
     runs-on: [self-hosted, Linux, X64, gorf, garmin-sync]
     timeout-minutes: 15
@@ -52,8 +62,10 @@ jobs:
       group: garmin-sync-gorf-deployment
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - name: Deploy tested native-only implementation
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: scripts/deploy-gorf.sh
