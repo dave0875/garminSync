@@ -8,7 +8,7 @@ target_root="$HOME/.local/bin/garmin-sync"
 target_bin="$HOME/.local/bin"
 target_unit="$HOME/.config/systemd/user/garmin-sync.service"
 retired_root="$HOME/.local/bin/garmin-retired"
-legacy_autostart="$HOME/.config/autostart/garmin-sync.desktop"
+autostart_dir="$HOME/.config/autostart"
 
 if [[ "$(id -un)" != "dbarker" || "$(hostname -s | tr '[:lower:]' '[:upper:]')" != "GORF" ]]; then
   echo "Refusing deployment: this script may only run as dbarker on GORF." >&2
@@ -99,8 +99,17 @@ done
 
 sdk_changed=0
 [[ "$installed_sdk" == "$expected_sdk" ]] || sdk_changed=1
+legacy_autostarts=()
+if [[ -d "$autostart_dir" ]]; then
+  for candidate in "$autostart_dir"/*.desktop; do
+    [[ -e "$candidate" ]] || continue
+    if grep -Eiq 'garmin_autodev_sync[.]sh|garmin-sync/garmin_sync[.]py[[:space:]]+daemon' "$candidate"; then
+      legacy_autostarts+=("$candidate")
+    fi
+  done
+fi
 legacy_changed=0
-[[ ! -e "$legacy_autostart" ]] || legacy_changed=1
+(( ${#legacy_autostarts[@]} == 0 )) || legacy_changed=1
 
 if (( runtime_changed == 0 && sdk_changed == 0 && legacy_changed == 0 )); then
   echo "No installed Garmin sync runtime change; leaving garmin-sync.service undisturbed."
@@ -126,9 +135,9 @@ for installed in "$target_root/garmin_sync.py" "$target_bin/garmin_fit_inspect.p
   "$target_root/build.json"; do
   backup_if_present "$installed"
 done
-if [[ -e "$legacy_autostart" ]]; then
-  cp -p -- "$legacy_autostart" "$backup/legacy-garmin-sync.desktop"
-fi
+for legacy in "${legacy_autostarts[@]}"; do
+  cp -p -- "$legacy" "$backup/legacy-$(basename "$legacy")"
+done
 
 printf '%s\n' \
   "source_commit=${GITHUB_SHA:-$(git -C "$repo_root" rev-parse HEAD)}" \
@@ -157,9 +166,9 @@ install_atomic "$repo_root/bin/garmin-syncctl" "$target_bin/garmin-syncctl" 0755
 install_atomic "$repo_root/bin/garmin_autodev_sync.sh" "$target_bin/garmin_autodev_sync.sh" 0755
 install_atomic "$repo_root/systemd/garmin-sync.service" "$target_unit" 0644
 
-if [[ -e "$legacy_autostart" ]]; then
-  rm -f -- "$legacy_autostart"
-fi
+for legacy in "${legacy_autostarts[@]}"; do
+  rm -f -- "$legacy"
+done
 
 commit="${GITHUB_SHA:-$(git -C "$repo_root" rev-parse HEAD)}"
 deployed_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
