@@ -218,6 +218,34 @@ class BasicTests(unittest.TestCase):
             state.update(status="failed")
             self.assertEqual(sync.State(path).snapshot()["last_success"], "previous")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+    def test_readiness_rejects_stale_pid_and_wrong_build(self):
+        state = {"daemon_pid": 123, "status": "waiting", "build": {"commit": "abc"}}
+        service = {"ActiveState": "active", "MainPID": "123", "SubState": "running"}
+        with mock.patch.object(sync, "service_snapshot", return_value=service), \
+             mock.patch.object(sync, "State") as state_type, \
+             mock.patch.object(sync, "build_info", return_value={"commit": "abc"}), \
+             mock.patch.object(sync, "enrolled_device", return_value=None):
+            state_type.return_value.snapshot.return_value = state
+            ready, _ = sync.readiness("abc")
+            self.assertTrue(ready)
+            state_type.return_value.snapshot.return_value = {**state, "daemon_pid": 122}
+            ready, _ = sync.readiness("abc")
+            self.assertFalse(ready)
+            state_type.return_value.snapshot.return_value = state
+            with mock.patch.object(sync, "build_info", return_value={"commit": "older"}):
+                ready, _ = sync.readiness("abc")
+                self.assertFalse(ready)
+
+    def test_status_is_unhealthy_until_device_is_enrolled(self):
+        payload = {
+            "service": {"ActiveState": "active", "MainPID": "123"},
+            "state": {"status": "waiting"},
+            "build": {"commit": "abc"},
+            "enrollment": None,
+        }
+        with mock.patch.object(sync, "readiness", return_value=(True, payload)):
+            self.assertEqual(sync.main(["status"]), 1)
+
     def test_runner_cancellation_kills_stubborn_child_group(self):
         with tempfile.TemporaryDirectory() as name:
             runner, results = sync.Runner(), []
