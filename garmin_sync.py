@@ -753,6 +753,24 @@ def readiness(expected_commit=None):
     return bool(ready), payload
 
 
+def conflicting_autostarts(directory=None):
+    directory = directory or (Path.home() / ".config/autostart")
+    conflicts = []
+    try:
+        candidates = sorted(directory.glob("*.desktop"))
+    except OSError:
+        return conflicts
+    pattern = re.compile(r"garmin_autodev_sync[.]sh|garmin-sync/garmin_sync[.]py\s+daemon",
+                         re.IGNORECASE)
+    for path in candidates:
+        try:
+            if pattern.search(path.read_text(errors="replace")):
+                conflicts.append(str(path))
+        except OSError:
+            continue
+    return conflicts
+
+
 def doctor():
     checks = {}
     checks["rclone_binary"] = Path(RCLONE).is_file()
@@ -791,8 +809,8 @@ def doctor():
     checks["inspector"] = INSPECTOR.is_file()
     checks["enrolled_device"] = bool(enrolled_device())
     checks["build_metadata"] = bool(build_info().get("commit"))
-    legacy = Path.home() / ".config/autostart/garmin-sync.desktop"
-    checks["legacy_autostart_retired"] = not legacy.exists()
+    checks["conflicting_autostarts"] = conflicting_autostarts()
+    checks["legacy_autostart_retired"] = not checks["conflicting_autostarts"]
     ok = all(checks[name] for name in ("rclone_binary", "gdrive_configured", "gdrive_available",
                                         "gio", "fit_sdk", "inspector", "enrolled_device",
                                         "build_metadata", "legacy_autostart_retired"))
