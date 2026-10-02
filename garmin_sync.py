@@ -19,10 +19,11 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 DESTINATION = "gdrive:Garmin/Fenix8_Backup"
 ARCHIVE_BASE = "gdrive:Garmin/Fenix8_Archive"
 RCLONE = "/usr/bin/rclone"
@@ -30,6 +31,8 @@ RUNTIME = Path(f"/run/user/{os.getuid()}/garmin-sync")
 STATE_PATH = Path.home() / ".local/state/garmin-sync/state.json"
 INSPECTOR = Path.home() / ".local/bin/garmin_fit_inspect.py"
 SDK_PYTHON = Path.home() / ".local/bin/garmin-sync/venv/bin/python3"
+DEVICE_PIN_PATH = Path.home() / ".config/garmin-sync/device.json"
+BUILD_PATH = Path.home() / ".local/bin/garmin-sync/build.json"
 EXCLUDED_EXTENSIONS = (
     "img|gma|unl|gcd|rgn|mp3|m4a|wav|aac|flac|ogg|wma|mp4|m4v|"
     "avi|mov|mkv|jpg|jpeg|png|gif|bmp|webp|heic|tif|tiff"
@@ -106,6 +109,51 @@ class Busy(Exception):
     pass
 
 
+class DiscoveryError(Exception):
+    pass
+
+
+def build_info(path=BUILD_PATH):
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def enrolled_device(path=DEVICE_PIN_PATH):
+    try:
+        data = json.loads(path.read_text())
+        identity = data.get("identity")
+        if isinstance(identity, str) and re.fullmatch(r"[0-9a-f]{64}", identity):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def save_enrollment(device, path=DEVICE_PIN_PATH):
+    private_dir(path.parent)
+    payload = {
+        "identity": device["identity"],
+        "model": device["model"],
+        "enrolled_at": now(),
+    }
+    fd, name = tempfile.mkstemp(prefix=".device-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(payload, handle, ensure_ascii=True, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(name, 0o600)
+        os.replace(name, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(name)
+    return payload
+
+
 class RunLocks:
     """Both locks also exclude the retired launcher during transition."""
     def __init__(self, runtime=RUNTIME, legacy=None):
@@ -172,7 +220,7 @@ def native_mount_paths(mounts):
     return paths
 
 
-def discover(mount_paths=(), uid=None, username=None):
+def discover(mount_paths=(), uid=None, username=None, expected_identity=None):
     uid = os.getuid() if uid is None else uid
     username = getpass.getuser() if username is None else username
     bases = list(dict.fromkeys(Path(path) for path in mount_paths))
@@ -190,8 +238,19 @@ def discover(mount_paths=(), uid=None, username=None):
             item = model_at(root)
             if item:
                 found.append(item)
+    if expected_identity:
+        matches = [item for item in found if item["identity"] == expected_identity]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise DiscoveryError("Enrolled Garmin identity appeared at multiple mount roots")
+        if found:
+            log("untrusted_device", sources=[item["root"] for item in found])
+            raise DiscoveryError("Connected fenix 8 is not the enrolled device")
+        return None
     if len(found) > 1:
         log("multiple_devices", sources=[item["root"] for item in found])
+        raise DiscoveryError("Multiple fenix 8 devices detected; enroll or connect only one")
     return found[0] if found else None
 
 
@@ -295,14 +354,25 @@ def mount_matches_source(mount, source):
     path = root.get_path()
     if path:
         return source == path or source.startswith(path.rstrip("/") + "/")
-    # Both observed Garmin transports expose native files through GVFS FUSE.
-    scheme = root.get_uri().partition(":")[0]
-    return scheme in ("mtp", "gphoto2") and "/gvfs/" + scheme + ":" in source
+    # Be conservative for URI-only mounts. A scheme match alone can confuse an
+    # unrelated phone removal with the Garmin. The scheduled rescan handles
+    # transports whose URI host cannot be correlated to the GVFS host.
+    uri = root.get_uri()
+    scheme = uri.partition(":")[0]
+    if scheme not in ("mtp", "gphoto2"):
+        return False
+    match = re.search(r"/gvfs/" + re.escape(scheme) + r":host=([^/]+)", source)
+    if not match:
+        return False
+    source_host = urllib.parse.unquote(match.group(1)).strip("[]")
+    uri_host = urllib.parse.unquote(urllib.parse.urlparse(uri).netloc).strip("[]")
+    return bool(uri_host) and uri_host == source_host
 
 
 class SyncRun:
     def __init__(self, state, runner=None, runtime=RUNTIME, destination=DESTINATION,
-                 archive_base=ARCHIVE_BASE, token=None, inspect=True):
+                 archive_base=ARCHIVE_BASE, token=None, inspect=True,
+                 inspector=INSPECTOR, sdk_python=SDK_PYTHON):
         self.state = state
         self.runner = runner or Runner()
         self.runtime = runtime
@@ -310,6 +380,8 @@ class SyncRun:
         self.archive_base = archive_base
         self.token = token
         self.inspect = inspect
+        self.inspector = Path(inspector)
+        self.sdk_python = Path(sdk_python)
 
     def update(self, **fields):
         if self.state:
@@ -418,10 +490,10 @@ class SyncRun:
         files = representative_files(inventory)
         if not files:
             return []
-        if not INSPECTOR.exists() or not SDK_PYTHON.exists():
+        if not self.inspector.exists() or not self.sdk_python.exists():
             return ["Optional FIT inspector unavailable; copied bytes were verified"]
         try:
-            output = self.runner.run([str(SDK_PYTHON), str(INSPECTOR),
+            output = self.runner.run([str(self.sdk_python), str(self.inspector),
                                       *[str(Path(source) / name) for name in files]], stderr, timeout=90,
                                      accepted_returncodes=(0, 1))
             results = json.loads(output)
@@ -450,7 +522,9 @@ class Controller:
         self.failures = 0
         self.stopping = False
         self.state.update(status="waiting", source=None, detected=False,
-                          connection_token=0, daemon_started_at=now())
+                          connection_token=0, daemon_started_at=now(),
+                          daemon_pid=os.getpid(), build=build_info(),
+                          enrolled=bool(enrolled_device()))
 
     def observe(self, source, disconnected_root=None):
         if self.stopping:
@@ -556,7 +630,22 @@ def daemon(state):
         return native_mount_paths(monitor.get_mounts())
 
     def scan(*_):
-        controller.observe(discover(mounts()))
+        pin = enrolled_device()
+        if not pin:
+            controller.observe(None)
+            state.update(status="unenrolled", detected=False, source=None,
+                         enrolled=False, last_error="No Garmin device is enrolled")
+            return True
+        try:
+            source = discover(mounts(), expected_identity=pin["identity"])
+        except DiscoveryError as exc:
+            controller.observe(None)
+            state.update(status="blocked", detected=False, source=None,
+                         enrolled=True, last_error=str(exc))
+            log("discovery_blocked", error=str(exc))
+            return True
+        state.update(enrolled=True)
+        controller.observe(source)
         return True
 
     def mount_removed(_, mount):
@@ -595,7 +684,14 @@ def daemon(state):
 
 
 def once(state, mode):
-    source = discover()
+    pin = enrolled_device()
+    if not pin:
+        if state:
+            state.update(status="unenrolled", detected=False, source=None,
+                         enrolled=False, last_error="No Garmin device is enrolled")
+        log("device_unenrolled")
+        return 3
+    source = discover(expected_identity=pin["identity"])
     if not source:
         if state:
             state.update(detected=False, source=None, status="waiting")
@@ -627,6 +723,86 @@ def once(state, mode):
             signal.signal(sig, handler)
 
 
+def service_snapshot():
+    service = subprocess.run(["/usr/bin/systemctl", "--user", "show", "garmin-sync.service",
+                              "--property=ActiveState,SubState,MainPID,Result"],
+                             capture_output=True, text=True)
+    fields = dict(line.split("=", 1) for line in service.stdout.splitlines() if "=" in line)
+    if service.returncode:
+        fields["error"] = service.stderr.strip()
+    return fields
+
+
+def readiness(expected_commit=None):
+    service = service_snapshot()
+    state = State().snapshot()
+    build = build_info()
+    main_pid = service.get("MainPID")
+    ready = (service.get("ActiveState") == "active" and main_pid not in (None, "", "0") and
+             str(state.get("daemon_pid")) == str(main_pid) and
+             state.get("status") not in ("stopped", "stopping", "failed"))
+    if expected_commit:
+        ready = ready and build.get("commit") == expected_commit and \
+            (state.get("build") or {}).get("commit") == expected_commit
+    payload = {"ready": bool(ready), "service": service, "state": state,
+               "build": build, "enrollment": enrolled_device()}
+    return bool(ready), payload
+
+
+def doctor():
+    checks = {}
+    checks["rclone_binary"] = Path(RCLONE).is_file()
+    if checks["rclone_binary"]:
+        remotes = subprocess.run([RCLONE, "listremotes"], capture_output=True, text=True)
+        checks["gdrive_remote"] = remotes.returncode == 0 and "gdrive:" in remotes.stdout.splitlines()
+    else:
+        checks["gdrive_remote"] = False
+    gio = subprocess.run(["/usr/bin/python3", "-c",
+                          "import gi; gi.require_version('Gio','2.0'); from gi.repository import Gio"],
+                         capture_output=True, text=True)
+    checks["gio"] = gio.returncode == 0
+    sdk = subprocess.run([str(SDK_PYTHON), "-c",
+                          "from importlib.metadata import version; print(version('garmin-fit-sdk'))"],
+                         capture_output=True, text=True) if SDK_PYTHON.exists() else None
+    checks["fit_sdk"] = bool(sdk and sdk.returncode == 0)
+    checks["fit_sdk_version"] = sdk.stdout.strip() if checks["fit_sdk"] else None
+    checks["inspector"] = INSPECTOR.is_file()
+    checks["enrolled_device"] = bool(enrolled_device())
+    checks["build_metadata"] = bool(build_info().get("commit"))
+    legacy = Path.home() / ".config/autostart/garmin-sync.desktop"
+    checks["legacy_autostart_retired"] = not legacy.exists()
+    ok = all(checks[name] for name in ("rclone_binary", "gdrive_remote", "gio", "fit_sdk",
+                                        "inspector", "enrolled_device", "build_metadata",
+                                        "legacy_autostart_retired"))
+    print(json.dumps({"ok": ok, "checks": checks}, indent=2))
+    return 0 if ok else 1
+
+
+def enroll(replace=False):
+    existing = enrolled_device()
+    if existing and not replace:
+        print(json.dumps({"enrolled": True, "device": existing,
+                          "message": "A device is already enrolled; use enroll --replace explicitly."},
+                         indent=2))
+        return 4
+    if existing and replace:
+        service = service_snapshot()
+        if service.get("ActiveState") == "active":
+            print("Stop garmin-sync.service before replacing the enrolled device.", file=sys.stderr)
+            return 75
+    try:
+        device = discover()
+    except DiscoveryError as exc:
+        log("enroll_failed", error=str(exc))
+        return 1
+    if not device:
+        log("device_absent")
+        return 2
+    saved = save_enrollment(device)
+    print(json.dumps({"enrolled": True, "device": saved}, indent=2))
+    return 0
+
+
 def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -635,30 +811,40 @@ def main(argv=None):
     commands.add_parser("daemon")
     single = commands.add_parser("once")
     single.add_argument("--dry-run", action="store_true")
-    for name in ("status", "force", "dry-run", "verify"):
+    for name in ("status", "force", "dry-run", "verify", "doctor", "readiness"):
         commands.add_parser(name)
+    enrollment = commands.add_parser("enroll")
+    enrollment.add_argument("--replace", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "status":
-        service = subprocess.run(["/usr/bin/systemctl", "--user", "show", "garmin-sync.service",
-                                  "--property=ActiveState,SubState,MainPID,Result"],
-                                 capture_output=True, text=True)
-        fields = dict(line.split("=", 1) for line in service.stdout.splitlines() if "=" in line)
-        if service.returncode:
-            fields["error"] = service.stderr.strip()
-        print(json.dumps({"service": fields, "state": State().snapshot()}, indent=2))
-        return 0
+        ready, payload = readiness()
+        healthy_states = {"waiting", "connected", "success", "retry_wait", "copy", "verifying", "dry-run"}
+        healthy = ready and bool(payload["enrollment"]) and payload["state"].get("status") in healthy_states
+        payload["healthy"] = bool(healthy)
+        print(json.dumps(payload, indent=2))
+        return 0 if healthy else 1
+    if args.command == "readiness":
+        ready, payload = readiness(os.environ.get("GARMIN_SYNC_EXPECT_COMMIT"))
+        print(json.dumps(payload, indent=2))
+        return 0 if ready else 1
+    if args.command == "doctor":
+        return doctor()
+    if args.command == "enroll":
+        return enroll(args.replace)
     if args.command in ("force", "dry-run"):
         sig = "USR1" if args.command == "force" else "USR2"
         log("request_sent", mode=args.command, signal=sig)
         return subprocess.call(["/usr/bin/systemctl", "--user", "kill", "--kill-who=main",
                                 "--signal=" + sig, "garmin-sync.service"])
-    if args.command == "verify" or (args.command == "once" and args.dry_run):
-        # Read-only runs cannot race the daemon's durable state file.
-        return once(None, "verify" if args.command == "verify" else "dry-run")
     try:
         with RunLocks():
-            state = State()
-            return daemon(state) if args.command == "daemon" else once(state, "copy")
+            if args.command == "daemon":
+                return daemon(State())
+            if args.command == "verify":
+                return once(None, "verify")
+            if args.command == "once" and args.dry_run:
+                return once(None, "dry-run")
+            return once(State(), "copy")
     except Busy as exc:
         log("busy", error=str(exc))
         return 75
