@@ -153,6 +153,8 @@ class BasicTests(unittest.TestCase):
             self.assertIsNotNone(sync.model_at(root))
             xml.write_text("<bad")
             self.assertIsNone(sync.model_at(root))
+            xml.write_text(XML.replace("<Id>fixture</Id>", ""))
+            self.assertIsNone(sync.model_at(root))
     def test_uri_only_mtp_removal_and_absent_once(self):
         mount = mock.Mock()
         mount.get_root.return_value.get_path.return_value = None
@@ -181,7 +183,10 @@ class BasicTests(unittest.TestCase):
             first_device = sync.model_at(first / "GARMIN")
             with self.assertRaises(sync.DiscoveryError):
                 sync.discover([str(first), str(second)], uid=9999, username="fixture")
-            found = sync.discover([str(first), str(second)], uid=9999, username="fixture",
+            with self.assertRaises(sync.DiscoveryError):
+                sync.discover([str(first), str(second)], uid=9999, username="fixture",
+                              expected_identity=first_device["identity"])
+            found = sync.discover([str(first)], uid=9999, username="fixture",
                                   expected_identity=first_device["identity"])
             self.assertEqual(found["root"], str(first / "GARMIN"))
             with self.assertRaisesRegex(sync.DiscoveryError, "not the enrolled"):
