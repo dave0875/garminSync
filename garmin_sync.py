@@ -764,20 +764,21 @@ def doctor():
         remotes = subprocess.run([RCLONE, "listremotes"], capture_output=True, text=True)
         checks["gdrive_configured"] = remotes.returncode == 0 and "gdrive:" in remotes.stdout.splitlines()
         if checks["gdrive_configured"]:
-            probe = subprocess.run(
-                [RCLONE, "lsf", "gdrive:Garmin", "--max-depth", "1", "--dirs-only",
-                 "--timeout", "15s", "--contimeout", "5s", "--retries", "1",
-                 "--low-level-retries", "1"],
-                capture_output=True, text=True, timeout=30)
-            checks["gdrive_available"] = probe.returncode == 0
-            archive = subprocess.run(
-                [RCLONE, "lsf", ARCHIVE_BASE, "--max-depth", "1", "--dirs-only",
-                 "--timeout", "15s", "--contimeout", "5s", "--retries", "1",
-                 "--low-level-retries", "1"],
-                capture_output=True, text=True, timeout=30)
-            if archive.returncode == 0:
-                checks["archive_run_directories"] = len(
-                    [line for line in archive.stdout.splitlines() if line.strip()])
+            remote_args = ["--timeout", "15s", "--contimeout", "5s", "--retries", "1",
+                           "--low-level-retries", "1"]
+            try:
+                probe = subprocess.run(
+                    [RCLONE, "lsf", "gdrive:Garmin", "--max-depth", "1", "--dirs-only",
+                     *remote_args], capture_output=True, text=True, timeout=30)
+                checks["gdrive_available"] = probe.returncode == 0
+                archive = subprocess.run(
+                    [RCLONE, "lsf", ARCHIVE_BASE, "--max-depth", "1", "--dirs-only",
+                     *remote_args], capture_output=True, text=True, timeout=30)
+                if archive.returncode == 0:
+                    checks["archive_run_directories"] = len(
+                        [line for line in archive.stdout.splitlines() if line.strip()])
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                checks["gdrive_error"] = str(exc)
     gio = subprocess.run(["/usr/bin/python3", "-c",
                           "import gi; gi.require_version('Gio','2.0'); from gi.repository import Gio"],
                          capture_output=True, text=True)
