@@ -191,7 +191,9 @@ def model_at(root):
         if not re.match(r"fenix\s*8(?:\D|$)", model, re.IGNORECASE):
             return None
         identity = next((node.text or "" for node in tree.iter()
-                         if node.tag.rsplit("}", 1)[-1] == "Id"), "")
+                         if node.tag.rsplit("}", 1)[-1] == "Id"), "").strip()
+        if not identity:
+            return None
         return {"root": str(root), "model": description,
                 "identity": hashlib.sha256(identity.encode()).hexdigest()}
     except (OSError, ET.ParseError):
@@ -238,19 +240,14 @@ def discover(mount_paths=(), uid=None, username=None, expected_identity=None):
             item = model_at(root)
             if item:
                 found.append(item)
-    if expected_identity:
-        matches = [item for item in found if item["identity"] == expected_identity]
-        if len(matches) == 1:
-            return matches[0]
-        if len(matches) > 1:
-            raise DiscoveryError("Enrolled Garmin identity appeared at multiple mount roots")
-        if found:
-            log("untrusted_device", sources=[item["root"] for item in found])
-            raise DiscoveryError("Connected fenix 8 is not the enrolled device")
-        return None
     if len(found) > 1:
         log("multiple_devices", sources=[item["root"] for item in found])
-        raise DiscoveryError("Multiple fenix 8 devices detected; enroll or connect only one")
+        raise DiscoveryError("Multiple fenix 8 devices detected; connect only the enrolled watch")
+    if expected_identity:
+        if found and found[0]["identity"] != expected_identity:
+            log("untrusted_device", source=found[0]["root"])
+            raise DiscoveryError("Connected fenix 8 is not the enrolled device")
+        return found[0] if found else None
     return found[0] if found else None
 
 
@@ -691,7 +688,14 @@ def once(state, mode):
                          enrolled=False, last_error="No Garmin device is enrolled")
         log("device_unenrolled")
         return 3
-    source = discover(expected_identity=pin["identity"])
+    try:
+        source = discover(expected_identity=pin["identity"])
+    except DiscoveryError as exc:
+        if state:
+            state.update(status="blocked", detected=False, source=None,
+                         enrolled=True, last_error=str(exc), failed_at=now())
+        log("discovery_blocked", error=str(exc))
+        return 1
     if not source:
         if state:
             state.update(detected=False, source=None, status="waiting")
