@@ -752,11 +752,28 @@ def readiness(expected_commit=None):
 def doctor():
     checks = {}
     checks["rclone_binary"] = Path(RCLONE).is_file()
+    checks["gdrive_configured"] = False
+    checks["gdrive_available"] = False
+    checks["archive_policy"] = "preserve_indefinitely_manual_review"
+    checks["archive_run_directories"] = None
     if checks["rclone_binary"]:
         remotes = subprocess.run([RCLONE, "listremotes"], capture_output=True, text=True)
-        checks["gdrive_remote"] = remotes.returncode == 0 and "gdrive:" in remotes.stdout.splitlines()
-    else:
-        checks["gdrive_remote"] = False
+        checks["gdrive_configured"] = remotes.returncode == 0 and "gdrive:" in remotes.stdout.splitlines()
+        if checks["gdrive_configured"]:
+            probe = subprocess.run(
+                [RCLONE, "lsf", "gdrive:Garmin", "--max-depth", "1", "--dirs-only",
+                 "--timeout", "15s", "--contimeout", "5s", "--retries", "1",
+                 "--low-level-retries", "1"],
+                capture_output=True, text=True, timeout=30)
+            checks["gdrive_available"] = probe.returncode == 0
+            archive = subprocess.run(
+                [RCLONE, "lsf", ARCHIVE_BASE, "--max-depth", "1", "--dirs-only",
+                 "--timeout", "15s", "--contimeout", "5s", "--retries", "1",
+                 "--low-level-retries", "1"],
+                capture_output=True, text=True, timeout=30)
+            if archive.returncode == 0:
+                checks["archive_run_directories"] = len(
+                    [line for line in archive.stdout.splitlines() if line.strip()])
     gio = subprocess.run(["/usr/bin/python3", "-c",
                           "import gi; gi.require_version('Gio','2.0'); from gi.repository import Gio"],
                          capture_output=True, text=True)
@@ -771,9 +788,9 @@ def doctor():
     checks["build_metadata"] = bool(build_info().get("commit"))
     legacy = Path.home() / ".config/autostart/garmin-sync.desktop"
     checks["legacy_autostart_retired"] = not legacy.exists()
-    ok = all(checks[name] for name in ("rclone_binary", "gdrive_remote", "gio", "fit_sdk",
-                                        "inspector", "enrolled_device", "build_metadata",
-                                        "legacy_autostart_retired"))
+    ok = all(checks[name] for name in ("rclone_binary", "gdrive_configured", "gdrive_available",
+                                        "gio", "fit_sdk", "inspector", "enrolled_device",
+                                        "build_metadata", "legacy_autostart_retired"))
     print(json.dumps({"ok": ok, "checks": checks}, indent=2))
     return 0 if ok else 1
 
