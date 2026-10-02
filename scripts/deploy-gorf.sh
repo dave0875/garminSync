@@ -145,6 +145,47 @@ printf '%s\n' \
   "previous_fit_sdk=${installed_sdk:-missing}" \
   "target_fit_sdk=$expected_sdk" > "$backup/manifest.txt"
 
+rollback_armed=0
+restore_one() {
+  local backup_name="$1" destination="$2"
+  if [[ -e "$backup/$backup_name" ]]; then
+    cp -p -- "$backup/$backup_name" "$destination"
+  else
+    rm -f -- "$destination"
+  fi
+}
+
+rollback() {
+  local code="${1:-1}"
+  if (( rollback_armed )); then
+    rollback_armed=0
+    trap - ERR INT TERM
+    set +e
+    echo "Deployment failed; restoring the previously installed Garmin runtime." >&2
+    restore_one "garmin_sync.py" "$target_root/garmin_sync.py"
+    restore_one "garmin_fit_inspect.py" "$target_bin/garmin_fit_inspect.py"
+    restore_one "garmin-syncctl" "$target_bin/garmin-syncctl"
+    restore_one "garmin_autodev_sync.sh" "$target_bin/garmin_autodev_sync.sh"
+    restore_one "garmin-sync.service" "$target_unit"
+    restore_one "build.json" "$target_root/build.json"
+    if [[ -n "${installed_sdk:-}" && "$installed_sdk" != "$expected_sdk" ]]; then
+      "$target_root/venv/bin/pip" install --disable-pip-version-check \
+        "garmin-fit-sdk==$installed_sdk" >/dev/null 2>&1
+    fi
+    for saved in "$backup"/legacy-*.desktop; do
+      [[ -e "$saved" ]] || continue
+      mkdir -p -m 700 "$autostart_dir"
+      cp -p -- "$saved" "$autostart_dir/${saved##*/legacy-}"
+    done
+    /usr/bin/systemctl --user daemon-reload
+    /usr/bin/systemctl --user start garmin-sync.service
+  fi
+  return "$code"
+}
+trap 'code=$?; rollback "$code"; exit "$code"' ERR
+trap 'rollback 130; exit 130' INT TERM
+rollback_armed=1
+
 # Stop only when a runtime/dependency migration is actually necessary. This
 # prevents README/runner-only pushes from interrupting an active watch copy.
 /usr/bin/systemctl --user stop garmin-sync.service || true
@@ -204,7 +245,10 @@ done
 if (( ready == 0 )); then
   echo "Deployment failed application-level readiness for $commit." >&2
   GARMIN_SYNC_EXPECT_COMMIT="$commit" /usr/bin/python3 "$target_root/garmin_sync.py" readiness || true
+  rollback 1
   exit 1
 fi
 
 GARMIN_SYNC_EXPECT_COMMIT="$commit" /usr/bin/python3 "$target_root/garmin_sync.py" readiness
+rollback_armed=0
+trap - ERR INT TERM
