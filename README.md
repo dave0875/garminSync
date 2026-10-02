@@ -48,8 +48,10 @@ mkdir -p ~/actions-runner-garmin-sync && cd ~/actions-runner-garmin-sync
 # from github.com/dave0875/garminSync/settings/actions/runners/new.
 ./config.sh --url https://github.com/dave0875/garminSync --token TOKEN \
   --name garmin-sync-gorf --labels gorf,garmin-sync --unattended
-./svc.sh install
-./svc.sh start
+install -Dm644 /path/to/garminSync/systemd/actions-runner-garmin-sync.service \
+  ~/.config/systemd/user/actions-runner-garmin-sync.service
+systemctl --user daemon-reload
+systemctl --user enable --now actions-runner-garmin-sync.service
 ```
 
 The repository must use a GitHub account token with repository creation and push access. The workstation's current `gh` token is expired, so authenticate with `gh auth login -h github.com` before creating or pushing the remote.
@@ -66,4 +68,3 @@ systemctl --user restart garmin-sync.service
 systemctl --user stop garmin-sync.service
 garmin-syncctl verify
 ```
-
