@@ -218,6 +218,16 @@ class BasicTests(unittest.TestCase):
             state.update(status="failed")
             self.assertEqual(sync.State(path).snapshot()["last_success"], "previous")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+    def test_conflicting_autostarts_detects_renamed_legacy_launcher(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            root.joinpath("unrelated.desktop").write_text(
+                "[Desktop Entry]\nExec=/usr/bin/true\n")
+            root.joinpath("renamed.desktop").write_text(
+                "[Desktop Entry]\nExec=/home/user/.local/bin/garmin_autodev_sync.sh\n")
+            conflicts = sync.conflicting_autostarts(root)
+            self.assertEqual(conflicts, [str(root / "renamed.desktop")])
+
     def test_readiness_rejects_stale_pid_and_wrong_build(self):
         state = {"daemon_pid": 123, "status": "waiting", "build": {"commit": "abc"}}
         service = {"ActiveState": "active", "MainPID": "123", "SubState": "running"}
