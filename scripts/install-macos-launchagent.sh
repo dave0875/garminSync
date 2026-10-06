@@ -2,7 +2,15 @@
 set -euo pipefail
 
 label="com.dave0875.garmin-sync"
-domain="gui/$(id -u)"
+
+if [[ "$(id -u)" -eq 0 ]]; then
+  echo "Do not run this LaunchAgent installer with sudo/root." >&2
+  echo "LaunchAgents belong to the logged-in user's GUI session." >&2
+  exit 77
+fi
+
+uid="$(id -u)"
+domain="gui/$uid"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 python="$repo_root/.venv/bin/python"
@@ -71,7 +79,25 @@ with plist_path.open("wb") as handle:
     plistlib.dump(payload, handle, sort_keys=False)
 PY
 
-/bin/launchctl bootout "$domain/$label" 2>/dev/null || true
+if /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then
+  /bin/launchctl bootout "$domain/$label"
+
+  # launchd can acknowledge bootout before the service has fully disappeared
+  # from the user's bootstrap namespace. Wait briefly so a repeated install is
+  # deterministic instead of racing bootstrap with teardown.
+  for _ in {1..50}; do
+    if ! /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  if /bin/launchctl print "$domain/$label" >/dev/null 2>&1; then
+    echo "Timed out waiting for $label to unload from $domain" >&2
+    exit 75
+  fi
+fi
+
 /bin/launchctl bootstrap "$domain" "$plist"
 /bin/launchctl enable "$domain/$label"
 /bin/launchctl kickstart -k "$domain/$label"
