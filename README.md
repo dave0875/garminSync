@@ -122,9 +122,15 @@ bash scripts/install-macos-launchagent.sh install
 The macOS transport invokes only the read side of libmtp. It inventories the device
 with `mtp-filetree` and `mtp-files`, downloads selected objects with repeated
 `mtp-connect --getfile` operations in bounded batches, verifies every staged object
-size, re-inventories the watch, and only then hands the local snapshot to the existing
-rclone copy/check pipeline. Maps, firmware/unlock assets, music, video, and images
-remain excluded exactly as on Linux.
+size, re-inventories the watch, and only then hands the local snapshot to rclone.
+Because that staged snapshot is immutable for the lifetime of the run, the macOS copy
+path skips the additional pre-copy Drive dry-run used for Linux's live mounted source.
+It also lets rclone traverse the destination normally instead of using
+`--no-traverse`, which avoids hundreds of individual Drive lookups when most files
+are unchanged. Archive-before-overwrite, checksum comparison, the final `rclone check`,
+identity pinning, and FIT diagnostics remain in place. Explicit `once --dry-run` still
+performs a single read-only Drive comparison. Maps, firmware/unlock assets, music,
+video, and images remain excluded exactly as on Linux.
 
 ## GORF deployment
 
