@@ -23,21 +23,54 @@ import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DESTINATION = "gdrive:Garmin/Fenix8_Backup"
 ARCHIVE_BASE = "gdrive:Garmin/Fenix8_Archive"
-RCLONE = "/usr/bin/rclone"
-RUNTIME = Path(f"/run/user/{os.getuid()}/garmin-sync")
+IS_DARWIN = sys.platform == "darwin"
+SOURCE_ROOT = Path(__file__).resolve().parent
+INSTALLED_ROOT = Path.home() / ".local/bin/garmin-sync"
+
+
+def resolve_executable(name, *preferred):
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in preferred:
+        if Path(candidate).is_file():
+            return candidate
+    return preferred[0] if preferred else name
+
+
+RCLONE = resolve_executable(
+    "rclone", "/usr/bin/rclone", "/opt/local/bin/rclone",
+    "/usr/local/bin/rclone", "/opt/homebrew/bin/rclone")
+MTP_FILETREE = resolve_executable(
+    "mtp-filetree", "/opt/local/bin/mtp-filetree", "/usr/local/bin/mtp-filetree",
+    "/opt/homebrew/bin/mtp-filetree")
+MTP_FILES = resolve_executable(
+    "mtp-files", "/opt/local/bin/mtp-files", "/usr/local/bin/mtp-files",
+    "/opt/homebrew/bin/mtp-files")
+MTP_CONNECT = resolve_executable(
+    "mtp-connect", "/opt/local/bin/mtp-connect", "/usr/local/bin/mtp-connect",
+    "/opt/homebrew/bin/mtp-connect")
+RUNTIME = (Path.home() / "Library/Caches/garmin-sync" if IS_DARWIN
+           else Path(f"/run/user/{os.getuid()}/garmin-sync"))
 STATE_PATH = Path.home() / ".local/state/garmin-sync/state.json"
-INSPECTOR = Path.home() / ".local/bin/garmin_fit_inspect.py"
-SDK_PYTHON = Path.home() / ".local/bin/garmin-sync/venv/bin/python3"
+INSPECTOR = (INSTALLED_ROOT.parent / "garmin_fit_inspect.py"
+             if (INSTALLED_ROOT.parent / "garmin_fit_inspect.py").is_file()
+             else SOURCE_ROOT / "garmin_fit_inspect.py")
+SDK_PYTHON = (INSTALLED_ROOT / "venv/bin/python3"
+              if (INSTALLED_ROOT / "venv/bin/python3").is_file()
+              else Path(sys.executable))
 DEVICE_PIN_PATH = Path.home() / ".config/garmin-sync/device.json"
-BUILD_PATH = Path.home() / ".local/bin/garmin-sync/build.json"
+BUILD_PATH = INSTALLED_ROOT / "build.json"
 EXCLUDED_EXTENSIONS = (
     "img|gma|unl|gcd|rgn|mp3|m4a|wav|aac|flac|ogg|wma|mp4|m4v|"
     "avi|mov|mkv|jpg|jpeg|png|gif|bmp|webp|heic|tif|tiff"
 )
 EXCLUDED_DIRECTORIES = "map|maps|custommaps|music|audio|audiobooks|podcasts|sid|remotesw|updatemanager"
+EXCLUDED_EXTENSION_SET = {value.casefold() for value in EXCLUDED_EXTENSIONS.split("|")}
+EXCLUDED_DIRECTORY_SET = {value.casefold() for value in EXCLUDED_DIRECTORIES.split("|")}
 # Exclusions precede the final inclusion; physiological FIT files have no size cap.
 FILTERS = [
     "--filter", "- {{(?i).*\\.(" + EXCLUDED_EXTENSIONS + ")}}",
@@ -259,6 +292,182 @@ class CommandFailed(Exception):
     pass
 
 
+_MTP_TREE_LINE = re.compile(r"^(?P<indent> *)(?P<id>\d+) (?P<name>.+)$")
+_MTP_FILE_ID = re.compile(r"^File ID: (?P<id>\d+)$")
+_MTP_FILE_SIZE = re.compile(r"^ File size (?P<size>\d+) ")
+_MTP_PARENT_ID = re.compile(r"^ Parent ID: (?P<id>\d+)$")
+_MTP_STORAGE_ID = re.compile(r"^ Storage ID: 0x(?P<id>[0-9A-Fa-f]+)$")
+
+
+def parse_mtp_filetree(output):
+    """Return MTP object-id -> slash-separated device path from mtp-filetree."""
+    paths = {}
+    stack = {}
+    for raw in output.splitlines():
+        match = _MTP_TREE_LINE.match(raw)
+        if not match:
+            continue
+        indent = len(match.group("indent"))
+        if indent % 2:
+            raise CommandFailed("Unexpected mtp-filetree indentation")
+        depth = indent // 2
+        name = match.group("name")
+        if name in (".", "..") or "/" in name or "\x00" in name:
+            raise CommandFailed("Unsafe MTP object name")
+        if depth:
+            parent = stack.get(depth - 1)
+            if parent is None:
+                raise CommandFailed("Malformed mtp-filetree hierarchy")
+            parts = (*parent, name)
+        else:
+            parts = (name,)
+        stack[depth] = parts
+        for key in tuple(stack):
+            if key > depth:
+                del stack[key]
+        paths[int(match.group("id"))] = "/".join(parts)
+    return paths
+
+
+def parse_mtp_files(output):
+    """Return metadata for actual files (folders are omitted by mtp-files)."""
+    records = {}
+    current = None
+    for raw in output.splitlines():
+        match = _MTP_FILE_ID.match(raw)
+        if match:
+            if current and current.get("size") is not None:
+                records[current["id"]] = current
+            current = {"id": int(match.group("id")), "size": None,
+                       "parent_id": None, "storage_id": None}
+            continue
+        if current is None:
+            continue
+        match = _MTP_FILE_SIZE.match(raw)
+        if match:
+            current["size"] = int(match.group("size"))
+            continue
+        match = _MTP_PARENT_ID.match(raw)
+        if match:
+            current["parent_id"] = int(match.group("id"))
+            continue
+        match = _MTP_STORAGE_ID.match(raw)
+        if match:
+            current["storage_id"] = int(match.group("id"), 16)
+    if current and current.get("size") is not None:
+        records[current["id"]] = current
+    return records
+
+
+def mtp_selected_inventory(tree_output, files_output):
+    """Join libmtp listings and apply the same native-file exclusions as rclone."""
+    paths = parse_mtp_filetree(tree_output)
+    files = parse_mtp_files(files_output)
+    selected = []
+    seen = set()
+    for object_id, metadata in files.items():
+        path = paths.get(object_id)
+        if not path:
+            continue
+        parts = path.split("/")
+        garmin_index = next((index for index, part in enumerate(parts)
+                             if part.casefold() == "garmin"), None)
+        if garmin_index is None or garmin_index == len(parts) - 1:
+            continue
+        relative_parts = parts[garmin_index + 1:]
+        if any(part.casefold() in EXCLUDED_DIRECTORY_SET for part in relative_parts[:-1]):
+            continue
+        suffix = Path(relative_parts[-1]).suffix.lstrip(".").casefold()
+        if suffix in EXCLUDED_EXTENSION_SET:
+            continue
+        relative = "/".join(relative_parts)
+        if relative.startswith("/") or ".." in Path(relative).parts:
+            raise CommandFailed("Unsafe MTP inventory path")
+        if relative in seen:
+            raise CommandFailed("Duplicate MTP path: " + relative)
+        seen.add(relative)
+        selected.append({"id": object_id, "path": relative, "size": metadata["size"]})
+    return sorted(selected, key=lambda item: item["path"].casefold())
+
+
+def mtp_inventory(runner, stderr):
+    for tool in (MTP_FILETREE, MTP_FILES, MTP_CONNECT):
+        if not Path(tool).is_file():
+            raise CommandFailed(f"Required libmtp tool not found: {tool}")
+    tree = runner.run([MTP_FILETREE], stderr, timeout=300)
+    files = runner.run([MTP_FILES], stderr, timeout=300)
+    selected = mtp_selected_inventory(tree, files)
+    if not selected:
+        raise DiscoveryError("No GARMIN files were exposed by the connected MTP device")
+    return selected
+
+
+def _mtp_signature(items):
+    return sorted((item["path"], item["size"]) for item in items)
+
+
+def download_mtp_entries(entries, garmin_root, runner, stderr, batch_size=96):
+    """Download read-only MTP objects in a few persistent libmtp sessions."""
+    garmin_root.mkdir(parents=True, exist_ok=True)
+    object_root = private_dir(garmin_root.parent / "objects")
+    for offset in range(0, len(entries), batch_size):
+        batch = entries[offset:offset + batch_size]
+        args = [MTP_CONNECT]
+        object_paths = {}
+        for item in batch:
+            target = object_root / f"{item['id']}.part"
+            with contextlib.suppress(FileNotFoundError):
+                target.unlink()
+            object_paths[item["id"]] = target
+            args.extend(["--getfile", f"{item['id']},{target}"])
+        runner.run(args, stderr, timeout=1230)
+        for item in batch:
+            staged = object_paths[item["id"]]
+            if not staged.is_file():
+                raise CommandFailed(f"MTP object {item['id']} was not downloaded")
+            if staged.stat().st_size != item["size"]:
+                raise CommandFailed(
+                    f"MTP object {item['id']} size changed during download "
+                    f"({staged.stat().st_size} != {item['size']})")
+            destination = garmin_root / item["path"]
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged, destination)
+
+
+@contextlib.contextmanager
+def stage_macos_device(expected_identity=None, metadata_only=False, runner=None):
+    """Materialize a verified read-only snapshot of a Fenix MTP filesystem."""
+    if not IS_DARWIN:
+        raise DiscoveryError("The libmtp staging transport is only used on macOS")
+    runner = runner or Runner()
+    private_dir(RUNTIME)
+    with tempfile.TemporaryDirectory(prefix="mtp-", dir=RUNTIME) as dirname:
+        root = Path(dirname)
+        stderr = root / "mtp.stderr.log"
+        before = mtp_inventory(runner, stderr)
+        xml = [item for item in before if item["path"].casefold() == "garmindevice.xml"]
+        if len(xml) != 1:
+            raise DiscoveryError("Expected exactly one GARMIN/GarminDevice.xml over MTP")
+        selected = xml if metadata_only else before
+        garmin_root = root / "GARMIN"
+        download_mtp_entries(selected, garmin_root, runner, stderr)
+        device = model_at(garmin_root)
+        if not device:
+            raise DiscoveryError("Connected MTP device is not a Fenix 8 with a valid GarminDevice.xml")
+        if expected_identity and device["identity"] != expected_identity:
+            raise DiscoveryError("Connected fenix 8 is not the enrolled device")
+        if not metadata_only:
+            after = mtp_inventory(runner, stderr)
+            if _mtp_signature(after) != _mtp_signature(before):
+                raise CommandFailed("MTP source inventory changed during staging; retry required")
+            final_device = model_at(garmin_root)
+            if final_device != device:
+                raise Cancelled("Device identity changed during MTP staging")
+        device["display_source"] = "mtp:Garmin/fenix8"
+        device["transport"] = "libmtp"
+        yield device
+
+
 class Runner:
     def __init__(self, cancellation=None):
         self.cancellation = cancellation or threading.Event()
@@ -302,7 +511,9 @@ class Runner:
                 if terminated is not None:
                     raise CommandFailed("Command exceeded finite duration")
                 if proc.returncode not in accepted_returncodes:
-                    raise CommandFailed(f"{Path(args[0]).name} {args[1]} exited {proc.returncode}; see {stderr_path}")
+                    action = args[1] if len(args) > 1 else Path(args[0]).name
+                    raise CommandFailed(
+                        f"{Path(args[0]).name} {action} exited {proc.returncode}; see {stderr_path}")
                 return stdout.decode("utf-8")
             finally:
                 with self.lock:
@@ -688,35 +899,52 @@ def once(state, mode):
                          enrolled=False, last_error="No Garmin device is enrolled")
         log("device_unenrolled")
         return 3
+
+    runner = Runner()
+    old_handlers = {}
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        old_handlers[sig] = signal.signal(sig, lambda *_: runner.cancel())
+
+    def execute(source):
+        display_source = source.get("display_source", source["root"])
+        if state:
+            state.update(detected=True, source=display_source, model=source["model"],
+                         transport=source.get("transport", "filesystem"))
+        result = SyncRun(state, runner=runner).execute(source["root"], mode)
+        if state:
+            fields = {**result, "status": "success", "completed_at": now(), "last_error": None}
+            if mode == "copy":
+                fields["last_success"] = now()
+                fields["last_success_details"] = {
+                    **result, "source": display_source, "completed_at": fields["last_success"]}
+            state.update(**fields)
+        return 0
+
     try:
-        source = discover(expected_identity=pin["identity"])
+        if IS_DARWIN:
+            with stage_macos_device(pin["identity"], runner=runner) as source:
+                return execute(source)
+
+        try:
+            source = discover(expected_identity=pin["identity"])
+        except DiscoveryError as exc:
+            if state:
+                state.update(status="blocked", detected=False, source=None,
+                             enrolled=True, last_error=str(exc), failed_at=now())
+            log("discovery_blocked", error=str(exc))
+            return 1
+        if not source:
+            if state:
+                state.update(detected=False, source=None, status="waiting")
+            log("device_absent")
+            return 2
+        return execute(source)
     except DiscoveryError as exc:
         if state:
             state.update(status="blocked", detected=False, source=None,
                          enrolled=True, last_error=str(exc), failed_at=now())
         log("discovery_blocked", error=str(exc))
         return 1
-    if not source:
-        if state:
-            state.update(detected=False, source=None, status="waiting")
-        log("device_absent")
-        return 2
-    runner = Runner()
-    old_handlers = {}
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        old_handlers[sig] = signal.signal(sig, lambda *_: runner.cancel())
-    try:
-        if state:
-            state.update(detected=True, source=source["root"], model=source["model"])
-        result = SyncRun(state, runner=runner).execute(source["root"], mode)
-        if state:
-            fields = {**result, "status": "success", "completed_at": now(), "last_error": None}
-            if mode == "copy":
-                fields["last_success"] = now()
-                fields["last_success_details"] = {**result, "source": source["root"],
-                                                  "completed_at": fields["last_success"]}
-            state.update(**fields)
-        return 0
     except (CommandFailed, Cancelled, OSError, ValueError) as exc:
         if state:
             state.update(status="failed", last_error=str(exc), failed_at=now())
@@ -725,7 +953,6 @@ def once(state, mode):
     finally:
         for sig, handler in old_handlers.items():
             signal.signal(sig, handler)
-
 
 def service_snapshot():
     service = subprocess.run(["/usr/bin/systemctl", "--user", "show", "garmin-sync.service",
@@ -773,6 +1000,7 @@ def conflicting_autostarts(directory=None):
 
 def doctor():
     checks = {}
+    checks["platform"] = "darwin" if IS_DARWIN else "linux"
     checks["rclone_binary"] = Path(RCLONE).is_file()
     checks["gdrive_configured"] = False
     checks["gdrive_available"] = False
@@ -797,10 +1025,23 @@ def doctor():
                         [line for line in archive.stdout.splitlines() if line.strip()])
             except (OSError, subprocess.TimeoutExpired) as exc:
                 checks["gdrive_error"] = str(exc)
-    gio = subprocess.run(["/usr/bin/python3", "-c",
-                          "import gi; gi.require_version('Gio','2.0'); from gi.repository import Gio"],
-                         capture_output=True, text=True)
-    checks["gio"] = gio.returncode == 0
+
+    if IS_DARWIN:
+        checks["mtp_tools"] = all(
+            Path(tool).is_file() for tool in (MTP_FILETREE, MTP_FILES, MTP_CONNECT))
+        checks["gio"] = "not_required"
+        checks["build_metadata"] = "not_required"
+        checks["conflicting_autostarts"] = []
+        checks["legacy_autostart_retired"] = True
+    else:
+        gio = subprocess.run(["/usr/bin/python3", "-c",
+                              "import gi; gi.require_version('Gio','2.0'); from gi.repository import Gio"],
+                             capture_output=True, text=True)
+        checks["gio"] = gio.returncode == 0
+        checks["build_metadata"] = bool(build_info().get("commit"))
+        checks["conflicting_autostarts"] = conflicting_autostarts()
+        checks["legacy_autostart_retired"] = not checks["conflicting_autostarts"]
+
     sdk = subprocess.run([str(SDK_PYTHON), "-c",
                           "from importlib.metadata import version; print(version('garmin-fit-sdk'))"],
                          capture_output=True, text=True) if SDK_PYTHON.exists() else None
@@ -808,15 +1049,16 @@ def doctor():
     checks["fit_sdk_version"] = sdk.stdout.strip() if checks["fit_sdk"] else None
     checks["inspector"] = INSPECTOR.is_file()
     checks["enrolled_device"] = bool(enrolled_device())
-    checks["build_metadata"] = bool(build_info().get("commit"))
-    checks["conflicting_autostarts"] = conflicting_autostarts()
-    checks["legacy_autostart_retired"] = not checks["conflicting_autostarts"]
-    ok = all(checks[name] for name in ("rclone_binary", "gdrive_configured", "gdrive_available",
-                                        "gio", "fit_sdk", "inspector", "enrolled_device",
-                                        "build_metadata", "legacy_autostart_retired"))
+
+    required = ["rclone_binary", "gdrive_configured", "gdrive_available",
+                "fit_sdk", "inspector", "enrolled_device"]
+    if IS_DARWIN:
+        required.append("mtp_tools")
+    else:
+        required.extend(["gio", "build_metadata", "legacy_autostart_retired"])
+    ok = all(bool(checks[name]) for name in required)
     print(json.dumps({"ok": ok, "checks": checks}, indent=2))
     return 0 if ok else 1
-
 
 def enroll(replace=False):
     existing = enrolled_device()
@@ -825,20 +1067,27 @@ def enroll(replace=False):
                           "message": "A device is already enrolled; use enroll --replace explicitly."},
                          indent=2))
         return 4
-    if existing and replace:
+    if existing and replace and not IS_DARWIN:
         service = service_snapshot()
         if service.get("ActiveState") == "active":
             print("Stop garmin-sync.service before replacing the enrolled device.", file=sys.stderr)
             return 75
     try:
-        device = discover()
+        if IS_DARWIN:
+            with stage_macos_device(metadata_only=True) as device:
+                saved = save_enrollment(device)
+        else:
+            device = discover()
+            if not device:
+                log("device_absent")
+                return 2
+            saved = save_enrollment(device)
     except DiscoveryError as exc:
         log("enroll_failed", error=str(exc))
         return 1
-    if not device:
-        log("device_absent")
-        return 2
-    saved = save_enrollment(device)
+    except (CommandFailed, Cancelled, OSError, ValueError) as exc:
+        log("enroll_failed", error=str(exc))
+        return 1
     print(json.dumps({"enrolled": True, "device": saved}, indent=2))
     return 0
 
@@ -857,6 +1106,20 @@ def main(argv=None):
     enrollment.add_argument("--replace", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "status":
+        if IS_DARWIN:
+            payload = {
+                "platform": "darwin",
+                "mode": "manual",
+                "state": State().snapshot(),
+                "enrollment": enrolled_device(),
+                "rclone": RCLONE,
+                "mtp_tools": [MTP_FILETREE, MTP_FILES, MTP_CONNECT],
+            }
+            payload["healthy"] = bool(
+                payload["enrollment"] and Path(RCLONE).is_file() and
+                all(Path(tool).is_file() for tool in payload["mtp_tools"]))
+            print(json.dumps(payload, indent=2))
+            return 0 if payload["healthy"] else 1
         ready, payload = readiness()
         healthy_states = {"waiting", "connected", "success", "retry_wait", "copy", "verifying", "dry-run"}
         healthy = ready and bool(payload["enrollment"]) and payload["state"].get("status") in healthy_states
@@ -864,6 +1127,10 @@ def main(argv=None):
         print(json.dumps(payload, indent=2))
         return 0 if healthy else 1
     if args.command == "readiness":
+        if IS_DARWIN:
+            print(json.dumps({"ready": False, "platform": "darwin",
+                              "reason": "macOS uses manual libmtp runs, not systemd readiness"}, indent=2))
+            return 1
         ready, payload = readiness(os.environ.get("GARMIN_SYNC_EXPECT_COMMIT"))
         print(json.dumps(payload, indent=2))
         return 0 if ready else 1
@@ -872,6 +1139,13 @@ def main(argv=None):
     if args.command == "enroll":
         return enroll(args.replace)
     if args.command in ("force", "dry-run"):
+        if IS_DARWIN:
+            try:
+                with RunLocks():
+                    return once(State(), "copy" if args.command == "force" else "dry-run")
+            except Busy as exc:
+                log("busy", error=str(exc))
+                return 75
         sig = "USR1" if args.command == "force" else "USR2"
         log("request_sent", mode=args.command, signal=sig)
         return subprocess.call(["/usr/bin/systemctl", "--user", "kill", "--kill-who=main",
@@ -879,6 +1153,10 @@ def main(argv=None):
     try:
         with RunLocks():
             if args.command == "daemon":
+                if IS_DARWIN:
+                    print("macOS automatic launchd mode is not installed; use 'force' or 'once'.",
+                          file=sys.stderr)
+                    return 64
                 return daemon(State())
             if args.command == "verify":
                 return once(None, "verify")

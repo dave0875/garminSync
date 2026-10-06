@@ -1,4 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec /usr/bin/python3 "$HOME/.local/bin/garmin-sync/garmin_sync.py" "$@"
 
+root="$HOME/.local/bin/garmin-sync"
+python="$root/venv/bin/python3"
+if [[ ! -x "$python" ]]; then
+  python="$(command -v python3 || true)"
+fi
+if [[ -z "$python" || ! -x "$python" ]]; then
+  echo "python3 is required" >&2
+  exit 69
+fi
+
+exec "$python" "$root/garmin_sync.py" "$@"
