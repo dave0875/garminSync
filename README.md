@@ -120,17 +120,20 @@ bash scripts/install-macos-launchagent.sh install
 ```
 
 The macOS transport invokes only the read side of libmtp. It inventories the device
-with `mtp-filetree` and `mtp-files`, downloads selected objects with repeated
-`mtp-connect --getfile` operations in bounded batches, verifies every staged object
-size, re-inventories the watch, and only then hands the local snapshot to rclone.
-Because that staged snapshot is immutable for the lifetime of the run, the macOS copy
+with `mtp-filetree` and `mtp-files`, then downloads selected objects with repeated
+`mtp-connect --getfile` operations packed into as few safe command sessions as the
+macOS argv budget allows. This matters because each `mtp-connect` process establishes a
+new libmtp session and device listing. Every staged object still receives an exact-size
+check, and the watch is re-inventoried after staging before Drive is touched.
+
+Because the staged snapshot is immutable for the lifetime of the run, the macOS copy
 path skips the additional pre-copy Drive dry-run used for Linux's live mounted source.
-It also lets rclone traverse the destination normally instead of using
-`--no-traverse`, which avoids hundreds of individual Drive lookups when most files
-are unchanged. Archive-before-overwrite, checksum comparison, the final `rclone check`,
-identity pinning, and FIT diagnostics remain in place. Explicit `once --dry-run` still
-performs a single read-only Drive comparison. Maps, firmware/unlock assets, music,
-video, and images remain excluded exactly as on Linux.
+Snapshot copy/check operations use rclone's bulk destination listing path rather than
+`--no-traverse`, reducing Google Drive API chatter when hundreds of files are unchanged.
+Archive-before-overwrite, checksum comparison, the final `rclone check`, identity
+pinning, post-stage MTP consistency verification, and FIT diagnostics remain in place.
+Explicit `once --dry-run` still performs a single read-only Drive comparison. Maps,
+firmware/unlock assets, music, video, and images remain excluded exactly as on Linux.
 
 ## GORF deployment
 
