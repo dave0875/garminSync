@@ -24,7 +24,7 @@ import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 DESTINATION = "gdrive:Garmin/Fenix8_Backup"
 ARCHIVE_BASE = "gdrive:Garmin/Fenix8_Archive"
 IS_DARWIN = sys.platform == "darwin"
@@ -607,7 +607,7 @@ class SyncRun:
         if self.state:
             self.state.update(token=self.token, **fields)
 
-    def execute(self, source, mode="copy"):
+    def execute(self, source, mode="copy", source_snapshot=False):
         private_dir(self.runtime)
         run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex
         with tempfile.TemporaryDirectory(prefix="run-", dir=self.runtime) as dirname:
@@ -658,15 +658,22 @@ class SyncRun:
                         archive=archive if mode == "copy" else None, run_started_at=now(),
                         selection="filters" if odd_names else "manifest", last_error=None)
             log("inventory", source=source, files=len(before), bytes=sum(i["Size"] for i in before),
-                run_id=run_id, mode=mode, representative_fit=representative_files(before))
+                run_id=run_id, mode=mode, source_snapshot=source_snapshot,
+                representative_fit=representative_files(before))
             if mode in ("copy", "dry-run"):
-                args = [RCLONE, "copy", source, self.destination, "--checksum", "--no-traverse",
-                        "--backup-dir", archive, "--max-duration", "20m", "--stats", "30s",
-                        *selection, *common]
+                args = [RCLONE, "copy", source, self.destination, "--checksum"]
+                # A verified macOS MTP snapshot is immutable for the lifetime of this run.
+                # Let rclone traverse Drive once instead of doing hundreds of per-file lookups.
+                if not source_snapshot:
+                    args.append("--no-traverse")
+                args += ["--backup-dir", archive, "--max-duration", "20m", "--stats", "30s",
+                         *selection, *common]
                 # Every whole-copy retry gets its own archive directory in the controller.
                 args += ["--retries", "1"]
                 if mode == "dry-run":
                     args.append("--dry-run")
+                elif source_snapshot:
+                    log("preview_skipped", run_id=run_id, reason="verified_snapshot")
                 else:
                     self.runner.run([*args, "--dry-run"], stderr)
                     proposed, preview_stats = read_changes(logfile)
@@ -922,7 +929,9 @@ def once(state, mode):
         if state:
             state.update(detected=True, source=display_source, model=source["model"],
                          transport=source.get("transport", "filesystem"))
-        result = SyncRun(state, runner=runner).execute(source["root"], mode)
+        source_snapshot = source.get("transport") == "libmtp"
+        result = SyncRun(state, runner=runner).execute(
+            source["root"], mode, source_snapshot=source_snapshot)
         if state:
             fields = {**result, "status": "success", "completed_at": now(), "last_error": None}
             if mode == "copy":
