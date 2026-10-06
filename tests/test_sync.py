@@ -468,12 +468,13 @@ class LocalRcloneTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         return path
-    def run_sync(self, mode="copy", runner=None, inspect=False):
+    def run_sync(self, mode="copy", runner=None, inspect=False, source_snapshot=False):
         sdk_python = sync.SDK_PYTHON if sync.SDK_PYTHON.exists() else Path(sys.executable)
         inspector = Path(sync.__file__).resolve().parent / "garmin_fit_inspect.py"
         return sync.SyncRun(self.state, runtime=self.base / "runtime", destination=str(self.destination),
                             archive_base=str(self.archive), runner=runner, inspect=inspect,
-                            inspector=inspector, sdk_python=sdk_python).execute(str(self.source), mode)
+                            inspector=inspector, sdk_python=sdk_python).execute(
+                                str(self.source), mode, source_snapshot=source_snapshot)
     def test_selection_checksum_idempotence_archive_no_deletion(self):
         calls = []
         class RecordingRunner(sync.Runner):
@@ -505,6 +506,41 @@ class LocalRcloneTests(unittest.TestCase):
         self.run_sync()
         self.assertTrue((self.destination / "Activity/activity.fit").exists())
         self.assertTrue((self.destination / "destination-only.fit").exists())
+    def test_verified_snapshot_fast_path_skips_preview_and_traverses_destination(self):
+        calls = []
+        class RecordingRunner(sync.Runner):
+            def run(self, args, *positional, **kwargs):
+                calls.append(args)
+                return super().run(args, *positional, **kwargs)
+
+        result = self.run_sync(runner=RecordingRunner(), source_snapshot=True)
+        copies = [args for args in calls if len(args) > 1 and args[1] == "copy"]
+        checks = [args for args in calls if len(args) > 1 and args[1] == "check"]
+
+        self.assertEqual(len(copies), 1)
+        self.assertNotIn("--dry-run", copies[0])
+        self.assertNotIn("--no-traverse", copies[0])
+        self.assertEqual(len(checks), 1)
+        self.assertFalse((Path(self.state.snapshot()["log_path"]) / "preview.jsonl").exists())
+        self.assertEqual((result["considered"], result["copied"], result["verified"]), (10, 10, 10))
+        self.assertTrue((self.destination / "Debug/MetricsBackup/metrics.fit").exists())
+
+    def test_verified_snapshot_dry_run_is_single_read_only_pass(self):
+        calls = []
+        class RecordingRunner(sync.Runner):
+            def run(self, args, *positional, **kwargs):
+                calls.append(args)
+                return super().run(args, *positional, **kwargs)
+
+        result = self.run_sync("dry-run", runner=RecordingRunner(), source_snapshot=True)
+        copies = [args for args in calls if len(args) > 1 and args[1] == "copy"]
+        self.assertEqual(len(copies), 1)
+        self.assertIn("--dry-run", copies[0])
+        self.assertNotIn("--no-traverse", copies[0])
+        self.assertEqual(result["verified"], 0)
+        self.assertFalse(self.destination.exists())
+        self.assertFalse(self.archive.exists())
+
     def test_dry_run_read_only(self):
         self.run_sync()
         before = {p.relative_to(self.destination): p.read_bytes() for p in self.destination.rglob("*") if p.is_file()}
