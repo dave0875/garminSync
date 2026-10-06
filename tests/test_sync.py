@@ -231,12 +231,28 @@ OK.
             runner = FakeRunner()
             root = Path(name) / "GARMIN"
             sync.download_mtp_entries(
-                entries, root, runner, Path(name) / "stderr.log", batch_size=1)
+                entries, root, runner, Path(name) / "stderr.log", max_items=1)
             self.assertEqual((root / "Activity/run.fit").read_bytes(), b"xxx")
             self.assertEqual(
                 (root / "Debug/MetricsBackup/metric.fit").read_bytes(), b"xxxx")
             self.assertEqual(len(runner.calls), 2)
             self.assertTrue(all(call[0] == sync.MTP_CONNECT for call in runner.calls))
+
+    def test_mtp_download_batching_collapses_normal_fenix_inventory(self):
+        entries = [
+            {"id": 16777216 + index, "path": f"Activity/{index:04d}.fit", "size": 100}
+            for index in range(824)
+        ]
+        batches = sync._mtp_download_batches(
+            entries, Path("/tmp/garmin-sync/objects"), max_items=1024,
+            arg_budget=96 * 1024)
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(len(batches[0]), 824)
+
+        constrained = sync._mtp_download_batches(
+            entries[:10], Path("/tmp/garmin-sync/objects"), max_items=3,
+            arg_budget=96 * 1024)
+        self.assertEqual([len(batch) for batch in constrained], [3, 3, 3, 1])
 
     def test_macos_ioreg_detects_fenix_usb_device(self):
         import plistlib
@@ -520,7 +536,9 @@ class LocalRcloneTests(unittest.TestCase):
         self.assertEqual(len(copies), 1)
         self.assertNotIn("--dry-run", copies[0])
         self.assertNotIn("--no-traverse", copies[0])
+        self.assertIn("--fast-list", copies[0])
         self.assertEqual(len(checks), 1)
+        self.assertIn("--fast-list", checks[0])
         self.assertFalse((Path(self.state.snapshot()["log_path"]) / "preview.jsonl").exists())
         self.assertEqual((result["considered"], result["copied"], result["verified"]), (10, 10, 10))
         self.assertTrue((self.destination / "Debug/MetricsBackup/metrics.fit").exists())
@@ -537,6 +555,7 @@ class LocalRcloneTests(unittest.TestCase):
         self.assertEqual(len(copies), 1)
         self.assertIn("--dry-run", copies[0])
         self.assertNotIn("--no-traverse", copies[0])
+        self.assertIn("--fast-list", copies[0])
         self.assertEqual(result["verified"], 0)
         self.assertFalse(self.destination.exists())
         self.assertFalse(self.archive.exists())
