@@ -168,6 +168,49 @@ OK.
         self.assertEqual(sync.parse_mtp_filetree(tree)[7],
                          "GARMIN/Debug/MetricsBackup/metrics.fit")
 
+    def test_real_fenix_libmtp_whitespace_fixture(self):
+        nbsp = "\u00a0"
+        tree = "\n".join([
+            "Device: fenix 8 - 51mm",
+            "Storage: Internal Storage",
+            "16777216 GARMIN",
+            f"{nbsp}{nbsp}16777226 Debug",
+            f"{nbsp}{nbsp}{nbsp}{nbsp}16777348 Uploads",
+            f"{nbsp}{nbsp}16777232 Activity",
+            f"{nbsp}{nbsp}{nbsp}{nbsp}16777505 2025-12-15-08-09-10.fit",
+            f"{nbsp}{nbsp}16777243 Monitor",
+            f"{nbsp}{nbsp}{nbsp}{nbsp}16777850 MA500000.FIT",
+            f"{nbsp}{nbsp}16777277 GarminDevice.xml",
+            "OK.",
+        ])
+        files = "\n".join([
+            "File ID: 16777505",
+            f"{nbsp}{nbsp}{nbsp} Filename: 2025-12-15-08-09-10.fit",
+            f"{nbsp}{nbsp}{nbsp} File size 2048 (0x0000000000000800) bytes",
+            f"{nbsp}{nbsp}{nbsp} Parent ID: 16777232",
+            f"{nbsp}{nbsp}{nbsp} Storage ID: 0x00020001",
+            "File ID: 16777850",
+            f"{nbsp}{nbsp}{nbsp} Filename: MA500000.FIT",
+            f"{nbsp}{nbsp}{nbsp} File size 4096 (0x0000000000001000) bytes",
+            f"{nbsp}{nbsp}{nbsp} Parent ID: 16777243",
+            f"{nbsp}{nbsp}{nbsp} Storage ID: 0x00020001",
+            "File ID: 16777277",
+            f"{nbsp}{nbsp}{nbsp} Filename: GarminDevice.xml",
+            f"{nbsp}{nbsp}{nbsp} File size 65513 (0x000000000000FFE9) bytes",
+            f"{nbsp}{nbsp}{nbsp} Parent ID: 16777216",
+            f"{nbsp}{nbsp}{nbsp} Storage ID: 0x00020001",
+        ])
+        inventory = sync.mtp_selected_inventory(tree, files)
+        self.assertEqual(
+            [(item["id"], item["path"], item["size"]) for item in inventory],
+            [(16777505, "Activity/2025-12-15-08-09-10.fit", 2048),
+             (16777277, "GarminDevice.xml", 65513),
+             (16777850, "Monitor/MA500000.FIT", 4096)])
+        self.assertEqual(
+            sync.parse_mtp_filetree(tree)[16777505],
+            "GARMIN/Activity/2025-12-15-08-09-10.fit")
+        self.assertEqual(sync.parse_mtp_files(files)[16777277]["parent_id"], 16777216)
+
     def test_mtp_download_batches_verify_sizes_before_materializing(self):
         entries = [
             {"id": 20, "path": "Activity/run.fit", "size": 3},
