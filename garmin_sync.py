@@ -292,11 +292,16 @@ class CommandFailed(Exception):
     pass
 
 
-_MTP_TREE_LINE = re.compile(r"^(?P<indent> *)(?P<id>\d+) (?P<name>.+)$")
-_MTP_FILE_ID = re.compile(r"^File ID: (?P<id>\d+)$")
-_MTP_FILE_SIZE = re.compile(r"^ File size (?P<size>\d+) ")
-_MTP_PARENT_ID = re.compile(r"^ Parent ID: (?P<id>\d+)$")
-_MTP_STORAGE_ID = re.compile(r"^ Storage ID: 0x(?P<id>[0-9A-Fa-f]+)$")
+_MTP_TREE_LINE = re.compile(r"^(?P<indent> *)(?P<id>\d+)\s+(?P<name>.+?)\s*$")
+_MTP_FILE_ID = re.compile(r"^\s*File ID:\s*(?P<id>\d+)\s*$")
+_MTP_FILE_SIZE = re.compile(r"^\s*File size\s+(?P<size>\d+)\b")
+_MTP_PARENT_ID = re.compile(r"^\s*Parent ID:\s*(?P<id>\d+)\s*$")
+_MTP_STORAGE_ID = re.compile(r"^\s*Storage ID:\s*0x(?P<id>[0-9A-Fa-f]+)\s*$")
+
+
+def normalize_mtp_line(raw):
+    """Normalize libmtp's terminal whitespace without changing object names."""
+    return raw.replace("\u00a0", " ").expandtabs(2)
 
 
 def parse_mtp_filetree(output):
@@ -304,7 +309,8 @@ def parse_mtp_filetree(output):
     paths = {}
     stack = {}
     for raw in output.splitlines():
-        match = _MTP_TREE_LINE.match(raw)
+        line = normalize_mtp_line(raw)
+        match = _MTP_TREE_LINE.match(line)
         if not match:
             continue
         indent = len(match.group("indent"))
@@ -334,7 +340,8 @@ def parse_mtp_files(output):
     records = {}
     current = None
     for raw in output.splitlines():
-        match = _MTP_FILE_ID.match(raw)
+        line = normalize_mtp_line(raw)
+        match = _MTP_FILE_ID.match(line)
         if match:
             if current and current.get("size") is not None:
                 records[current["id"]] = current
@@ -343,15 +350,15 @@ def parse_mtp_files(output):
             continue
         if current is None:
             continue
-        match = _MTP_FILE_SIZE.match(raw)
+        match = _MTP_FILE_SIZE.match(line)
         if match:
             current["size"] = int(match.group("size"))
             continue
-        match = _MTP_PARENT_ID.match(raw)
+        match = _MTP_PARENT_ID.match(line)
         if match:
             current["parent_id"] = int(match.group("id"))
             continue
-        match = _MTP_STORAGE_ID.match(raw)
+        match = _MTP_STORAGE_ID.match(line)
         if match:
             current["storage_id"] = int(match.group("id"), 16)
     if current and current.get("size") is not None:
