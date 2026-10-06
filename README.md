@@ -3,10 +3,17 @@
 Native, read-only preservation of a physically connected Garmin Fenix 8 to `gdrive:Garmin/Fenix8_Backup`.
 
 ```text
-Fenix 8 native filesystem -> GVFS/GIO discovery -> rclone copy/check -> Google Drive
-                                           \
-                                            -> optional official garmin-fit-sdk diagnostics
+Linux: Fenix 8 native filesystem -> GVFS/GIO ----------\
+                                                      +-> rclone copy/check -> Google Drive
+macOS: Fenix 8 MTP -> libmtp read-only staging --------/
+                                                      \
+                                                       -> optional official garmin-fit-sdk diagnostics
 ```
+
+On macOS the watch is not required to mount beneath `/Volumes`. The libmtp transport
+first materializes a temporary, verified snapshot of the selected `GARMIN` tree. No
+Google Drive mutation begins until staging completes and the enrolled Fenix identity
+has been confirmed.
 
 The device filesystem is authoritative. `rclone copy` is non-destructive: destination-only objects remain, changed destination objects are placed beneath `gdrive:Garmin/Fenix8_Archive`, and the watch is never written to. FIT decoding is post-copy diagnostics; it cannot reject a legitimate native artifact.
 
@@ -20,7 +27,7 @@ Maps, unlock/firmware assets, music, video, and image media are excluded. All ot
 
 - `garmin_sync.py` — discovery, locking, raw transport, verification, state.
 - `garmin_fit_inspect.py` — read-only official FIT SDK diagnostics.
-- `systemd/` and `bin/` — installed user-service and operator entry points.
+- `systemd/` and `bin/` — Linux user-service and portable operator entry points.
 - `tests/` — controller and local-rclone regression fixtures.
 - `scripts/deploy-gorf.sh` — guarded, atomic per-user deployment for GORF.
 
@@ -37,6 +44,54 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 ```
 
 CI installs and verifies the tooling used by its static guards, proves the production source contains no cloud-client references, smoke-tests GIO, exercises the checkout's official FIT SDK inspector with valid and corrupt FIT inputs, and runs the local-rclone regression suite. It does not access a watch, Drive, or credentials.
+
+## macOS manual sync
+
+macOS uses the same archive, checksum verification, identity pinning, exclusions, and
+FIT diagnostics as Linux, but reads the watch through libmtp instead of GVFS. Automatic
+`launchd` operation is intentionally not enabled yet; macOS runs are manual.
+
+Prerequisites on a MacPorts system:
+
+```bash
+sudo port install python312 rclone libmtp
+sudo port select --set python3 python312
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+Configure the same Google Drive remote used by production:
+
+```bash
+rclone config
+rclone listremotes
+rclone lsf gdrive:Garmin --max-depth 1
+```
+
+With exactly one Fenix 8 connected over USB/MTP, enroll it once and run a dry-run before
+the first copy:
+
+```bash
+.venv/bin/python garmin_sync.py enroll
+.venv/bin/python garmin_sync.py once --dry-run
+.venv/bin/python garmin_sync.py once
+.venv/bin/python garmin_sync.py verify
+```
+
+After enrollment, the shorter manual aliases are also available:
+
+```bash
+.venv/bin/python garmin_sync.py dry-run
+.venv/bin/python garmin_sync.py force
+.venv/bin/python garmin_sync.py status
+```
+
+The macOS transport invokes only the read side of libmtp. It inventories the device
+with `mtp-filetree` and `mtp-files`, downloads selected objects with repeated
+`mtp-connect --getfile` operations in bounded batches, verifies every staged object
+size, re-inventories the watch, and only then hands the local snapshot to the existing
+rclone copy/check pipeline. Maps, firmware/unlock assets, music, video, and images
+remain excluded exactly as on Linux.
 
 ## GORF deployment
 
@@ -80,6 +135,10 @@ systemctl --user start garmin-sync.service
 `gdrive:Garmin/Fenix8_Archive` is preservation storage for overwritten destination objects. The default policy is **preserve indefinitely; no automatic deletion**. `garmin-syncctl doctor` reports the number of top-level archive run directories so growth is visible and can be reviewed manually before any future retention policy is introduced.
 
 ## Operator commands
+
+The commands below are Linux/GORF service operations unless noted. On macOS use
+`once`, `dry-run`, `force`, and `verify` as described above.
+
 
 ```bash
 garmin-syncctl status
