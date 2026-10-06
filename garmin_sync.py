@@ -24,7 +24,7 @@ import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 DESTINATION = "gdrive:Garmin/Fenix8_Backup"
 ARCHIVE_BASE = "gdrive:Garmin/Fenix8_Archive"
 IS_DARWIN = sys.platform == "darwin"
@@ -418,12 +418,34 @@ def _mtp_signature(items):
     return sorted((item["path"], item["size"]) for item in items)
 
 
-def download_mtp_entries(entries, garmin_root, runner, stderr, batch_size=96):
-    """Download read-only MTP objects in a few persistent libmtp sessions."""
+def _mtp_download_batches(entries, object_root, max_items=1024, arg_budget=96 * 1024):
+    """Pack getfile operations while leaving ample headroom below macOS exec argv limits."""
+    batches = []
+    batch = []
+    used = len(str(MTP_CONNECT)) + 1
+    for item in entries:
+        target = object_root / f"{item['id']}.part"
+        # Approximate exec argv bytes including separators/NULs for both arguments.
+        cost = len("--getfile") + 1 + len(str(item["id"])) + 1 + len(str(target)) + 2
+        if batch and (len(batch) >= max_items or used + cost > arg_budget):
+            batches.append(batch)
+            batch = []
+            used = len(str(MTP_CONNECT)) + 1
+        batch.append(item)
+        used += cost
+    if batch:
+        batches.append(batch)
+    return batches
+
+
+def download_mtp_entries(entries, garmin_root, runner, stderr, max_items=1024,
+                         arg_budget=96 * 1024):
+    """Download read-only MTP objects using as few persistent libmtp sessions as practical."""
     garmin_root.mkdir(parents=True, exist_ok=True)
     object_root = private_dir(garmin_root.parent / "objects")
-    for offset in range(0, len(entries), batch_size):
-        batch = entries[offset:offset + batch_size]
+    batches = _mtp_download_batches(entries, object_root, max_items=max_items,
+                                    arg_budget=arg_budget)
+    for batch in batches:
         args = [MTP_CONNECT]
         object_paths = {}
         for item in batch:
@@ -444,6 +466,7 @@ def download_mtp_entries(entries, garmin_root, runner, stderr, batch_size=96):
             destination = garmin_root / item["path"]
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(staged, destination)
+    return len(batches)
 
 
 @contextlib.contextmanager
@@ -456,20 +479,31 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
     with tempfile.TemporaryDirectory(prefix="mtp-", dir=RUNTIME) as dirname:
         root = Path(dirname)
         stderr = root / "mtp.stderr.log"
+        started = time.monotonic()
         before = mtp_inventory(runner, stderr)
+        log("mtp_inventory_completed", files=len(before),
+            seconds=round(time.monotonic() - started, 3))
         xml = [item for item in before if item["path"].casefold() == "garmindevice.xml"]
         if len(xml) != 1:
             raise DiscoveryError("Expected exactly one GARMIN/GarminDevice.xml over MTP")
         selected = xml if metadata_only else before
         garmin_root = root / "GARMIN"
-        download_mtp_entries(selected, garmin_root, runner, stderr)
+        download_started = time.monotonic()
+        sessions = download_mtp_entries(selected, garmin_root, runner, stderr)
+        log("mtp_download_completed", files=len(selected),
+            bytes=sum(item["size"] for item in selected), sessions=sessions,
+            seconds=round(time.monotonic() - download_started, 3))
         device = model_at(garmin_root)
         if not device:
             raise DiscoveryError("Connected MTP device is not a Fenix 8 with a valid GarminDevice.xml")
         if expected_identity and device["identity"] != expected_identity:
             raise DiscoveryError("Connected fenix 8 is not the enrolled device")
         if not metadata_only:
+            reinventory_started = time.monotonic()
             after = mtp_inventory(runner, stderr)
+            log("mtp_reinventory_completed", files=len(after),
+                seconds=round(time.monotonic() - reinventory_started, 3),
+                stage_seconds=round(time.monotonic() - started, 3))
             if _mtp_signature(after) != _mtp_signature(before):
                 raise CommandFailed("MTP source inventory changed during staging; retry required")
             final_device = model_at(garmin_root)
@@ -663,8 +697,11 @@ class SyncRun:
             if mode in ("copy", "dry-run"):
                 args = [RCLONE, "copy", source, self.destination, "--checksum"]
                 # A verified macOS MTP snapshot is immutable for the lifetime of this run.
-                # Let rclone traverse Drive once instead of doing hundreds of per-file lookups.
-                if not source_snapshot:
+                # Let rclone enumerate the remote in bulk instead of doing per-directory or
+                # per-file Drive lookups.
+                if source_snapshot:
+                    args.append("--fast-list")
+                else:
                     args.append("--no-traverse")
                 args += ["--backup-dir", archive, "--max-duration", "20m", "--stats", "30s",
                          *selection, *common]
@@ -699,8 +736,10 @@ class SyncRun:
                 return {"mode": mode, "considered": len(before), "copied": copied,
                         "verified": 0, "archive": None, "fit_warnings": []}
             self.update(status="verifying")
-            self.runner.run([RCLONE, "check", source, self.destination, "--one-way",
-                             *selection, *common], stderr)
+            check_args = [RCLONE, "check", source, self.destination, "--one-way"]
+            if source_snapshot:
+                check_args.append("--fast-list")
+            self.runner.run([*check_args, *selection, *common], stderr)
             if signature(inventory()) != signature(before):
                 raise CommandFailed("Source inventory changed during verification; retry required")
             if self.runner.cancellation.is_set() or model_at(Path(source)) != original_device:
