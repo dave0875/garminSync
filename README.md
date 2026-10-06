@@ -45,11 +45,14 @@ PYTHONPATH=. python3 -m unittest discover -s tests -v
 
 CI installs and verifies the tooling used by its static guards, proves the production source contains no cloud-client references, smoke-tests GIO, exercises the checkout's official FIT SDK inspector with valid and corrupt FIT inputs, and runs the local-rclone regression suite. It does not access a watch, Drive, or credentials.
 
-## macOS manual sync
+## macOS sync
 
 macOS uses the same archive, checksum verification, identity pinning, exclusions, and
-FIT diagnostics as Linux, but reads the watch through libmtp instead of GVFS. Automatic
-`launchd` operation is intentionally not enabled yet; macOS runs are manual.
+FIT diagnostics as Linux, but reads the watch through libmtp instead of GVFS. It can
+run manually or under a per-user LaunchAgent that syncs once when the enrolled Fenix 8
+appears on USB, then waits for a physical disconnect before another successful sync can
+be triggered. Failed runs are retried with bounded backoff while the watch remains
+connected.
 
 Prerequisites on a MacPorts system:
 
@@ -84,6 +87,36 @@ After enrollment, the shorter manual aliases are also available:
 .venv/bin/python garmin_sync.py dry-run
 .venv/bin/python garmin_sync.py force
 .venv/bin/python garmin_sync.py status
+```
+
+### Automatic reconnect sync with launchd
+
+Install the user LaunchAgent from the checked-out repository:
+
+```bash
+bash scripts/install-macos-launchagent.sh install
+```
+
+The LaunchAgent starts the repository's `.venv/bin/python garmin_sync.py watch` process
+at login and keeps it running. The watcher checks the macOS USB registry without opening
+MTP. When a Fenix 8 USB connection appears, it acquires the normal process lock and runs
+one guarded copy. The existing enrollment check still verifies the actual watch identity
+before any Drive mutation.
+
+Useful operations:
+
+```bash
+bash scripts/install-macos-launchagent.sh status
+tail -f ~/Library/Logs/garmin-sync/watch.log
+bash scripts/install-macos-launchagent.sh uninstall
+```
+
+After updating the repository or virtualenv, reinstalling the LaunchAgent is safe and
+restarts it against the current checkout:
+
+```bash
+git pull origin main
+bash scripts/install-macos-launchagent.sh install
 ```
 
 The macOS transport invokes only the read side of libmtp. It inventories the device
