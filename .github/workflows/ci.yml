@@ -37,8 +37,8 @@ jobs:
         run: |
           set -euo pipefail
           python -m py_compile garmin_sync.py garmin_fit_inspect.py tests/test_sync.py
-          bash -n bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh
-          shellcheck bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh
+          bash -n bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh scripts/install-macos-launchagent.sh
+          shellcheck bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh scripts/install-macos-launchagent.sh
           command -v rg >/dev/null
           if rg -in 'garth|garminconnect|garmin_cloud_sync|garmin-browser-auth|connectapi[.]garmin|sso[.]garmin|CloudMetrics|[.]garth' garmin_sync.py garmin_fit_inspect.py bin systemd scripts; then
             echo "Forbidden cloud-client reference detected" >&2
