@@ -130,6 +130,86 @@ class BasicTests(unittest.TestCase):
             mount.get_root.return_value.get_path.return_value = path
             mount.get_root.return_value.get_uri.return_value = uri
         self.assertEqual(sync.native_mount_paths([unrelated, device]), ["/run/user/1000/gvfs/mtp:host=091e_fixture"])
+    def test_mtp_inventory_parser_preserves_native_files_and_exclusions(self):
+        tree = """libmtp version: 1.1.21
+Device: fenix 8
+Storage: Internal Storage
+1 GARMIN
+  2 GarminDevice.xml
+  3 Activity
+    4 2026-10-05.fit
+  5 Debug
+    6 MetricsBackup
+      7 metrics.fit
+  8 Maps
+    9 basemap.fit
+  10 Music
+    11 song.fit
+  12 MAP.IMG
+  13 state.bin
+OK.
+"""
+        def record(object_id, size, parent):
+            return (f"File ID: {object_id}\n Filename: fixture\n File size {size} "
+                    f"(0x00000000) bytes\n Parent ID: {parent}\n"
+                    " Storage ID: 0x00020001\n Filetype: Unknown filetype\n")
+        files = "".join([
+            record(2, 100, 1), record(4, 200, 3), record(7, 300, 6),
+            record(9, 400, 8), record(11, 500, 10), record(12, 600, 1),
+            record(13, 700, 1),
+        ])
+        inventory = sync.mtp_selected_inventory(tree, files)
+        self.assertEqual(
+            [(item["id"], item["path"], item["size"]) for item in inventory],
+            [(4, "Activity/2026-10-05.fit", 200),
+             (7, "Debug/MetricsBackup/metrics.fit", 300),
+             (2, "GarminDevice.xml", 100),
+             (13, "state.bin", 700)])
+        self.assertEqual(sync.parse_mtp_filetree(tree)[7],
+                         "GARMIN/Debug/MetricsBackup/metrics.fit")
+
+    def test_mtp_download_batches_verify_sizes_before_materializing(self):
+        entries = [
+            {"id": 20, "path": "Activity/run.fit", "size": 3},
+            {"id": 21, "path": "Debug/MetricsBackup/metric.fit", "size": 4},
+        ]
+        sizes = {item["id"]: item["size"] for item in entries}
+        class FakeRunner:
+            def __init__(self):
+                self.calls = []
+            def run(self, args, *_args, **_kwargs):
+                self.calls.append(args)
+                for index, value in enumerate(args):
+                    if value == "--getfile":
+                        object_id, target = args[index + 1].split(",", 1)
+                        Path(target).write_bytes(b"x" * sizes[int(object_id)])
+                return ""
+        with tempfile.TemporaryDirectory() as name:
+            runner = FakeRunner()
+            root = Path(name) / "GARMIN"
+            sync.download_mtp_entries(
+                entries, root, runner, Path(name) / "stderr.log", batch_size=1)
+            self.assertEqual((root / "Activity/run.fit").read_bytes(), b"xxx")
+            self.assertEqual(
+                (root / "Debug/MetricsBackup/metric.fit").read_bytes(), b"xxxx")
+            self.assertEqual(len(runner.calls), 2)
+            self.assertTrue(all(call[0] == sync.MTP_CONNECT for call in runner.calls))
+
+    def test_macos_force_and_dry_run_do_not_signal_systemd(self):
+        class Lock:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+        with mock.patch.object(sync, "IS_DARWIN", True), \
+             mock.patch.object(sync, "RunLocks", return_value=Lock()), \
+             mock.patch.object(sync, "once", return_value=0) as once, \
+             mock.patch.object(subprocess, "call",
+                               side_effect=AssertionError("systemd must not be called")):
+            self.assertEqual(sync.main(["dry-run"]), 0)
+            self.assertEqual(once.call_args.args[1], "dry-run")
+            once.reset_mock()
+            self.assertEqual(sync.main(["force"]), 0)
+            self.assertEqual(once.call_args.args[1], "copy")
+
     def test_single_instance_and_legacy_lock(self):
         with tempfile.TemporaryDirectory() as name:
             runtime, legacy = Path(name) / "runtime", Path(name) / "legacy"
