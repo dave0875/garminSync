@@ -24,7 +24,7 @@ import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DESTINATION = "gdrive:Garmin/Fenix8_Backup"
 ARCHIVE_BASE = "gdrive:Garmin/Fenix8_Archive"
 IS_DARWIN = sys.platform == "darwin"
@@ -57,6 +57,7 @@ MTP_CONNECT = resolve_executable(
 IOREG = "/usr/sbin/ioreg"
 GARMIN_USB_VENDOR_ID = 0x091E
 FENIX8_USB_PRODUCT_ID = 0x51B5
+MACOS_LAUNCHD_LABEL = "com.dave0875.garmin-sync"
 RUNTIME = (Path.home() / "Library/Caches/garmin-sync" if IS_DARWIN
            else Path(f"/run/user/{os.getuid()}/garmin-sync"))
 STATE_PATH = Path.home() / ".local/state/garmin-sync/state.json"
@@ -1148,6 +1149,15 @@ def fenix_present_in_ioreg(data):
     return False
 
 
+def macos_launchagent_loaded():
+    if not IS_DARWIN:
+        return False
+    result = subprocess.run(
+        ["/bin/launchctl", "print", f"gui/{os.getuid()}/{MACOS_LAUNCHD_LABEL}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return result.returncode == 0
+
+
 def macos_fenix_usb_present():
     if not IS_DARWIN:
         return False
@@ -1245,7 +1255,8 @@ def main(argv=None):
         if IS_DARWIN:
             payload = {
                 "platform": "darwin",
-                "mode": "manual",
+                "mode": "watch_or_manual",
+                "launchagent_loaded": macos_launchagent_loaded(),
                 "state": State().snapshot(),
                 "enrollment": enrolled_device(),
                 "rclone": RCLONE,
