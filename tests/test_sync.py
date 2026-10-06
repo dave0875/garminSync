@@ -238,6 +238,46 @@ OK.
             self.assertEqual(len(runner.calls), 2)
             self.assertTrue(all(call[0] == sync.MTP_CONNECT for call in runner.calls))
 
+    def test_macos_ioreg_detects_fenix_usb_device(self):
+        import plistlib
+        fixture = [{
+            "IORegistryEntryChildren": [
+                {"idVendor": 0x1234, "idProduct": 0x5678},
+                {"idVendor": 0x091E, "idProduct": 0x51B5,
+                 "USB Product Name": "fenix 8 - 51mm"},
+            ]
+        }]
+        self.assertTrue(sync.fenix_present_in_ioreg(plistlib.dumps(fixture)))
+        fixture[0]["IORegistryEntryChildren"][1]["idProduct"] = 0x9999
+        fixture[0]["IORegistryEntryChildren"][1]["USB Product Name"] = "fenix 8 - 51mm"
+        self.assertTrue(sync.fenix_present_in_ioreg(plistlib.dumps(fixture)))
+        fixture[0]["IORegistryEntryChildren"][1]["USB Product Name"] = "Other Garmin"
+        self.assertFalse(sync.fenix_present_in_ioreg(plistlib.dumps(fixture)))
+
+    def test_macos_watch_syncs_once_per_connection_edge(self):
+        sequence = iter([False, True, True, False, True, False])
+        class Stop:
+            def __init__(self): self.count = 0
+            def is_set(self): return self.count >= 6
+            def wait(self, _seconds): self.count += 1
+            def set(self): self.count = 6
+        class Lock:
+            def __enter__(self): return self
+            def __exit__(self, *_): return False
+        state = sync.State(Path(self.temp.name) / "watch-state.json") if hasattr(self, "temp") else None
+        if state is None:
+            temp = tempfile.TemporaryDirectory()
+            self.addCleanup(temp.cleanup)
+            state = sync.State(Path(temp.name) / "watch-state.json")
+        with mock.patch.object(sync, "IS_DARWIN", True), \
+             mock.patch.object(sync, "RunLocks", return_value=Lock()), \
+             mock.patch.object(sync, "once", return_value=0) as once:
+            rc = sync.macos_watch(
+                state, poll_seconds=0, presence=lambda: next(sequence), stop_event=Stop())
+        self.assertEqual(rc, 0)
+        self.assertEqual(once.call_count, 2)
+        self.assertTrue(all(call.args[1] == "copy" for call in once.call_args_list))
+
     def test_macos_force_and_dry_run_do_not_signal_systemd(self):
         class Lock:
             def __enter__(self): return self

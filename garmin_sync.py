@@ -9,6 +9,7 @@ import getpass
 import hashlib
 import json
 import os
+import plistlib
 from pathlib import Path
 import re
 import signal
@@ -23,7 +24,7 @@ import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 DESTINATION = "gdrive:Garmin/Fenix8_Backup"
 ARCHIVE_BASE = "gdrive:Garmin/Fenix8_Archive"
 IS_DARWIN = sys.platform == "darwin"
@@ -53,6 +54,10 @@ MTP_FILES = resolve_executable(
 MTP_CONNECT = resolve_executable(
     "mtp-connect", "/opt/local/bin/mtp-connect", "/usr/local/bin/mtp-connect",
     "/opt/homebrew/bin/mtp-connect")
+IOREG = "/usr/sbin/ioreg"
+GARMIN_USB_VENDOR_ID = 0x091E
+FENIX8_USB_PRODUCT_ID = 0x51B5
+MACOS_LAUNCHD_LABEL = "com.dave0875.garmin-sync"
 RUNTIME = (Path.home() / "Library/Caches/garmin-sync" if IS_DARWIN
            else Path(f"/run/user/{os.getuid()}/garmin-sync"))
 STATE_PATH = Path.home() / ".local/state/garmin-sync/state.json"
@@ -1099,12 +1104,146 @@ def enroll(replace=False):
     return 0
 
 
+def _integer_property(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, bytes):
+        return int.from_bytes(value, "little") if value else None
+    if isinstance(value, str):
+        try:
+            return int(value, 0)
+        except ValueError:
+            return None
+    return None
+
+
+def _walk_plist(value):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_plist(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _walk_plist(child)
+
+
+def fenix_present_in_ioreg(data):
+    """Return True when the enrolled Fenix USB model is visible in an IORegistry plist."""
+    try:
+        tree = plistlib.loads(data)
+    except (plistlib.InvalidFileException, ValueError, TypeError) as exc:
+        raise CommandFailed("Unable to parse macOS USB registry") from exc
+    for node in _walk_plist(tree):
+        vendor = _integer_property(node.get("idVendor"))
+        product = _integer_property(node.get("idProduct"))
+        if vendor == GARMIN_USB_VENDOR_ID and product == FENIX8_USB_PRODUCT_ID:
+            return True
+        if vendor == GARMIN_USB_VENDOR_ID:
+            product_name = " ".join(
+                str(node.get(key, "")) for key in
+                ("USB Product Name", "kUSBProductString", "Product Name", "IORegistryEntryName"))
+            if re.search(r"fenix\s*8", product_name, re.IGNORECASE):
+                return True
+    return False
+
+
+def macos_launchagent_loaded():
+    if not IS_DARWIN:
+        return False
+    result = subprocess.run(
+        ["/bin/launchctl", "print", f"gui/{os.getuid()}/{MACOS_LAUNCHD_LABEL}"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    return result.returncode == 0
+
+
+def macos_fenix_usb_present():
+    if not IS_DARWIN:
+        return False
+    try:
+        result = subprocess.run(
+            [IOREG, "-p", "IOUSB", "-a", "-l", "-w", "0"],
+            capture_output=True, timeout=15, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CommandFailed("Unable to query macOS USB registry") from exc
+    if result.returncode:
+        raise CommandFailed(
+            "ioreg failed while querying USB devices: " +
+            result.stderr.decode("utf-8", errors="replace").strip())
+    return fenix_present_in_ioreg(result.stdout)
+
+
+def macos_watch(state, poll_seconds=5, retry_seconds=120, presence=None, stop_event=None):
+    """Sync once per Fenix USB connection; retry failures while still connected."""
+    if not IS_DARWIN:
+        print("watch is only supported on macOS", file=sys.stderr)
+        return 64
+    presence = presence or macos_fenix_usb_present
+    stop_event = stop_event or threading.Event()
+    old_handlers = {}
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            old_handlers[sig] = signal.signal(sig, lambda *_: stop_event.set())
+
+    connected = False
+    synced = False
+    retry_at = 0.0
+    log("watch_started", pid=os.getpid(), poll_seconds=poll_seconds)
+    try:
+        while not stop_event.is_set():
+            try:
+                present = bool(presence())
+            except (CommandFailed, OSError, ValueError) as exc:
+                log("usb_probe_failed", error=str(exc))
+                stop_event.wait(max(poll_seconds, 15))
+                continue
+
+            if present and not connected:
+                connected = True
+                synced = False
+                retry_at = 0.0
+                log("usb_connected", vendor_id=hex(GARMIN_USB_VENDOR_ID),
+                    product_id=hex(FENIX8_USB_PRODUCT_ID))
+            elif not present and connected:
+                connected = False
+                synced = False
+                retry_at = 0.0
+                state.update(detected=False, source=None, status="waiting")
+                log("usb_disconnected")
+
+            if connected and not synced and time.monotonic() >= retry_at:
+                try:
+                    with RunLocks():
+                        rc = once(state, "copy")
+                except Busy as exc:
+                    rc = 75
+                    log("auto_sync_busy", error=str(exc))
+                if rc == 0:
+                    synced = True
+                    retry_at = 0.0
+                    log("auto_sync_completed")
+                else:
+                    retry_at = time.monotonic() + retry_seconds
+                    log("auto_sync_retry_scheduled", returncode=rc,
+                        retry_after_seconds=retry_seconds)
+
+            stop_event.wait(poll_seconds)
+    finally:
+        for sig, handler in old_handlers.items():
+            signal.signal(sig, handler)
+        state.update(status="stopped", stopped_at=now())
+        log("watch_stopped")
+    return 0
+
+
 def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", action="version", version=VERSION)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("daemon")
+    commands.add_parser("watch")
     single = commands.add_parser("once")
     single.add_argument("--dry-run", action="store_true")
     for name in ("status", "force", "dry-run", "verify", "doctor", "readiness"):
@@ -1116,7 +1255,8 @@ def main(argv=None):
         if IS_DARWIN:
             payload = {
                 "platform": "darwin",
-                "mode": "manual",
+                "mode": "watch_or_manual",
+                "launchagent_loaded": macos_launchagent_loaded(),
                 "state": State().snapshot(),
                 "enrollment": enrolled_device(),
                 "rclone": RCLONE,
@@ -1145,6 +1285,8 @@ def main(argv=None):
         return doctor()
     if args.command == "enroll":
         return enroll(args.replace)
+    if args.command == "watch":
+        return macos_watch(State())
     if args.command in ("force", "dry-run"):
         if IS_DARWIN:
             try:
@@ -1161,7 +1303,7 @@ def main(argv=None):
         with RunLocks():
             if args.command == "daemon":
                 if IS_DARWIN:
-                    print("macOS automatic launchd mode is not installed; use 'force' or 'once'.",
+                    print("Use the macOS 'watch' command under launchd instead of daemon.",
                           file=sys.stderr)
                     return 64
                 return daemon(State())
