@@ -1022,7 +1022,8 @@ def once(state, mode):
         result = SyncRun(state, runner=runner).execute(
             source["root"], mode, source_snapshot=source_snapshot)
         if state:
-            fields = {**result, "status": "success", "completed_at": now(), "last_error": None}
+            phase = "success" if mode == "copy" else "verified_only" if mode == "verify" else "previewed"
+            fields = {**result, "status": phase, "completed_at": now(), "last_error": None}
             if mode == "copy":
                 fields["last_success"] = now()
                 fields["last_success_details"] = {
