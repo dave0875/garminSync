@@ -176,6 +176,22 @@ systemctl --user start garmin-sync.service
 
 `gdrive:Garmin/Fenix8_Archive` is preservation storage for overwritten destination objects. The default policy is **preserve indefinitely; no automatic deletion**. `garmin-syncctl doctor` reports the number of top-level archive run directories so growth is visible and can be reviewed manually before any future retention policy is introduced.
 
+## Backup health versus process readiness
+
+`garmin-syncctl status` now includes a `sync_health` object in addition to the
+existing service `healthy` field. A running service and a previous successful
+run are **not** evidence that a newly connected watch or activity is backed up.
+
+- `waiting_for_device`: no mounted enrolled watch; last success is historical.
+- `connected_unverified`: the watch is visible, but this mount session has no verified copy yet.
+- `syncing`: a copy/verification is active; the backup is not yet proven.
+- `synced`: the currently mounted watch completed a verified copy in this daemon session.
+- `degraded`: device unenrolled, run failed/blocked/retrying, or daemon not ready.
+
+`readiness` remains the process/build deployment gate and does not require a
+plugged-in device. The `healthy` field preserves backward-compatible service
+semantics; use `sync_health.state` when deciding whether an activity is backed up.
+
 ## Operator commands
 
 The commands below are Linux/GORF service operations unless noted. On macOS use
