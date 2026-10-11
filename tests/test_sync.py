@@ -168,6 +168,62 @@ class SyncHealthTests(unittest.TestCase):
         self.assertTrue(output["healthy"])
         self.assertEqual(output["sync_health"]["condition"], "waiting_for_device")
 
+
+class DiscoveryTelemetryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "sys"
+        self.root.mkdir()
+
+    def device(self, name, vendor, product):
+        node = self.root / name
+        node.mkdir()
+        (node / "idVendor").write_text(vendor)
+        (node / "idProduct").write_text(product)
+        return node
+
+    def test_absent_preboot_fenix_and_other_device_are_separate(self):
+        self.assertEqual(sync.linux_garmin_usb_probe(self.root), "absent")
+        self.device("other", "046d", "c52b")
+        self.assertEqual(sync.linux_garmin_usb_probe(self.root), "absent")
+        preboot = self.device("preboot", "091e", "0003")
+        self.assertEqual(sync.linux_garmin_usb_probe(self.root), "garmin_preboot_usb")
+        (preboot / "idProduct").write_text("51b5")
+        self.assertEqual(sync.linux_garmin_usb_probe(self.root), "fenix_usb")
+
+    def test_unavailable_probe_does_not_claim_watch_is_absent(self):
+        self.assertEqual(sync.linux_garmin_usb_probe(self.root / "missing"), "unavailable")
+        with mock.patch.object(sync, "IS_DARWIN", True):
+            self.assertEqual(sync.linux_garmin_usb_probe(self.root), "unsupported")
+
+    def test_observation_is_transition_only_and_measures_real_recovery(self):
+        state = sync.State(self.root / "state.json")
+        seconds = [0.0]
+        events = []
+        with mock.patch.object(sync, "log", side_effect=lambda event, **fields:
+                               events.append((event, fields))):
+            tracker = sync.DiscoveryTelemetry(
+                state, clock=lambda: seconds[0], timestamp=lambda: "2026-10-11T21:00:00+00:00")
+            tracker.observe("absent", False)
+            self.assertEqual(state.snapshot()["discovery_state"], "not_mounted")
+            tracker.observe("fenix_usb", False)
+            seconds[0] = 5.0
+            tracker.observe("fenix_usb", False)
+            self.assertEqual(len(events), 2)
+            self.assertEqual(state.snapshot()["discovery_transitions"], 2)
+            self.assertEqual(sync.sync_health({"status": "waiting", "detected": False,
+                                              **state.snapshot()}, True)["condition"],
+                             "awaiting_mtp_mount")
+            seconds[0] = 9.5
+            tracker.observe("fenix_usb", True)
+            self.assertEqual(state.snapshot()["usb_to_mtp_recovery_seconds"], 9.5)
+            self.assertEqual(state.snapshot()["discovery_state"], "mtp_mounted")
+            self.assertEqual(len(events), 3)
+            tracker.observe("absent", False)
+            self.assertEqual(state.snapshot()["discovery_state"], "not_mounted")
+            self.assertEqual(state.snapshot()["discovery_transitions"], 4)
+
 class BasicTests(unittest.TestCase):
     def setUp(self):
         quiet = mock.patch.object(sync, "log")
