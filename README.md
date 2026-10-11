@@ -197,3 +197,12 @@ systemctl --user start garmin-sync.service
 ```
 
 `status` reports the live systemd PID, daemon PID, enrolled-device state, and deployed build metadata; it exits non-zero when the application is not healthy. `readiness` is an internal deployment probe that verifies process/build initialization even when a newly installed service is intentionally waiting for its first enrollment.
+
+`status` also includes independent `sync_health` data: `condition` (`waiting_for_device`,
+`awaiting_verification`, `syncing`, `verified`, `degraded`, `unenrolled`, or
+`service_unavailable`), mounted-device availability, last verified backup timestamp,
+age in seconds, and 24-hour freshness classification. An absent watch is normal and
+is **not** a deployment-readiness failure; a running daemon alone does **not** prove
+that today's workout was saved. The 24-hour freshness window is informational,
+not an automatic assumption about the user's training frequency. `healthy` remains
+backward-compatible service/enrollment health, **not** proof of recent backup.
