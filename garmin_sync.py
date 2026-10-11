@@ -1373,6 +1373,8 @@ def main(argv=None):
         healthy_states = {"waiting", "connected", "success", "retry_wait", "copy", "verifying", "dry-run"}
         healthy = ready and bool(payload["enrollment"]) and payload["state"].get("status") in healthy_states
         payload["healthy"] = bool(healthy)
+        payload["sync_health"] = sync_health(
+            payload["state"], ready, enrolled=bool(payload["enrollment"]))
         print(json.dumps(payload, indent=2))
         return 0 if healthy else 1
     if args.command == "readiness":
