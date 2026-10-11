@@ -500,6 +500,22 @@ OK.
                     {"status": "waiting", "detected": False, "mtp_mount_delayed": True},
                     enrolled=True)["state"], "degraded")
 
+    def test_activity_selection_timestamp_and_fallback_provenance(self):
+        files = [
+            {"Path": "Monitor/latest.fit", "ModTime": "2026-10-12T12:00:00Z"},
+            {"Path": "Activity/2026-10-10-08-17-40.fit", "ModTime": "2026-10-12T15:00:00Z"},
+            {"Path": "Activity/2026-10-11-08-17-40.fit", "ModTime": "2026-10-11T12:00:00Z"},
+            {"Path": "Activity/OLDNAME.FIT", "ModTime": "2026-10-13T12:00:00Z"},
+        ]
+        chosen = sync.latest_activity_fit(files)
+        self.assertEqual(chosen["relative_path"], "Activity/2026-10-11-08-17-40.fit")
+        self.assertEqual(chosen["selection_basis"], "filename_timestamp")
+        self.assertEqual(sync.latest_activity_fit([files[-1]])["selection_basis"],
+                         "modtime_fallback")
+        self.assertIsNone(sync.latest_activity_fit([files[0]]))
+        self.assertEqual(sync.latest_activity_fit(
+            [{"Path": "activity/UNKNOWN.FIT"}])["selection_basis"], "path_fallback")
+
     def test_conflicting_autostarts_detects_renamed_legacy_launcher(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
@@ -625,6 +641,52 @@ class LocalRcloneTests(unittest.TestCase):
         self.run_sync()
         self.assertTrue((self.destination / "Activity/activity.fit").exists())
         self.assertTrue((self.destination / "destination-only.fit").exists())
+    def test_verified_activity_only_promoted_after_successful_checked_copy(self):
+        path = "Activity/2026-10-11-08-17-40.fit"
+        self.write(path, b"half marathon raw FIT fixture")
+        with mock.patch.object(sync, "log") as events:
+            result = self.run_sync()
+        activity = result["verified_activity"]
+        self.assertEqual(activity["relative_path"], path)
+        self.assertEqual(activity["selection_basis"], "filename_timestamp")
+        self.assertEqual(activity["mode"], "copy")
+        self.assertEqual(activity["destination_path"], str(self.destination / path))
+        self.assertEqual(self.state.snapshot()["last_verified_activity"], activity)
+        self.assertEqual(sum(call.args[0] == "activity_verified"
+                             for call in events.call_args_list), 1)
+        self.assertEqual(self.run_sync()["copied"], 0)
+        self.assertEqual(self.state.snapshot()["last_verified_activity"]["relative_path"], path)
+        previous = self.state.snapshot()["last_verified_activity"]
+        # Verify-only proves a matching existing backup, but cannot assert a new copy.
+        existing_activity = self.run_sync("verify")
+        self.assertEqual(existing_activity["verified_activity"]["relative_path"], path)
+        self.assertEqual(existing_activity["verified_activity"]["mode"], "verify")
+        self.assertEqual(self.state.snapshot()["last_verified_activity"], previous)
+        self.write("Activity/2026-10-12-08-17-40.fit", b"new activity")
+        self.run_sync("dry-run")
+        self.assertEqual(self.state.snapshot()["last_verified_activity"], previous)
+        class FailedCheckRunner(sync.Runner):
+            def run(self, args, *positional, **kwargs):
+                if len(args) > 1 and args[1] == "check":
+                    raise sync.CommandFailed("simulated check failure")
+                return super().run(args, *positional, **kwargs)
+        with mock.patch.object(sync, "log") as events:
+            with self.assertRaisesRegex(sync.CommandFailed, "check failure"):
+                self.run_sync(runner=FailedCheckRunner())
+        self.assertEqual(self.state.snapshot()["last_verified_activity"], previous)
+        self.assertFalse(any(call.args[0] == "activity_verified"
+                             for call in events.call_args_list))
+
+    def test_no_activity_fit_preserves_historical_verified_activity(self):
+        self.write("Activity/2026-10-11-08-17-40.fit", b"first")
+        self.run_sync()
+        prior = self.state.snapshot()["last_verified_activity"]
+        for file in (self.source / "Activity").iterdir():
+            file.unlink()
+        result = self.run_sync()
+        self.assertIsNone(result["verified_activity"])
+        self.assertEqual(self.state.snapshot()["last_verified_activity"], prior)
+
     def test_verified_snapshot_fast_path_skips_preview_and_traverses_destination(self):
         calls = []
         class RecordingRunner(sync.Runner):

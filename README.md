@@ -212,6 +212,35 @@ be diagnosed by this observer. For physical enumeration failures use
 The daemon never resets USB devices, reads privileged kernel logs, or
 changes the existing enrolled-device verification.
 
+## Proven activity backup reporting
+
+After a successful `rclone check --one-way` and a final source inventory and
+watch identity check, the sync records one `activity_verified` journal event
+for the newest selected native Activity FIT. `garmin-syncctl status` exposes
+`last_verified_activity` (also retained in `state.last_verified_activity`),
+including the relative filename, the exact Google Drive destination path,
+run ID, timestamp, verification method, source mode, and selection basis.
+
+An Activity filename such as `Activity/2026-10-11-08-17-40.fit` uses the embedded
+timestamp. Unusual/legacy names use file modified time or deterministic name
+ordering as a **best-effort latest candidate**, with explicit
+`selection_basis` provenance. The reported file *is* verified when the
+verification event appears, but a fallback is not proof it is chronologically
+the most recently recorded activity.
+
+A `preview_completed`, `copy_completed`, or `inventory` log alone is never
+proof that a workout reached Drive. Dry-runs cannot promote an activity;
+verify-only reports `verified_activity` for that run but does not overwrite
+the previously established successful-copy `last_verified_activity`.
+Failed or interrupted runs also preserve the historical good record. If no
+Activity FIT is selected, the new run reports none and retains its previous
+historical record without claiming it is current.
+
+For the Oct 11 half marathon, look for the precise FIT in the successful
+`activity_verified` journal event (and match its `run_id` to `verified`),
+then inspect `garmin-syncctl status`. The actual Drive backup remains
+unconfirmed until such evidence exists.
+
 ## Operator commands
 
 The commands below are Linux/GORF service operations unless noted. On macOS use
