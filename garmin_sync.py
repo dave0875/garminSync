@@ -173,7 +173,9 @@ def sync_health(state, service_ready, enrolled=True, current_time=None):
     elif phase in ("blocked", "failed", "retry_wait"):
         condition = "degraded"
     elif not detected:
-        condition = "waiting_for_device"
+        condition = ("awaiting_mtp_mount"
+                     if state.get("usb_state") in DiscoveryTelemetry.USB_PRESENT
+                     else "waiting_for_device")
     elif phase in ("copy", "verifying", "dry-run"):
         condition = "syncing"
     elif phase == "success" and last:
@@ -190,7 +192,96 @@ def sync_health(state, service_ready, enrolled=True, current_time=None):
         "last_error": state.get("last_error"),
         "last_failure_at": state.get("failed_at"),
         "last_connection_change_at": state.get("connection_changed_at"),
+        "usb_state": state.get("usb_state", "unavailable"),
+        "discovery_state": state.get("discovery_state", "unknown"),
+        "discovery_last_scan_at": state.get("discovery_last_scan_at"),
+        "discovery_transitions": state.get("discovery_transitions", 0),
+        "usb_to_mtp_recovery_seconds": state.get("usb_to_mtp_recovery_seconds"),
     }
+
+
+def linux_garmin_usb_probe(root=Path("/sys/bus/usb/devices")):
+    """Read-only vendor/product presence, not evidence of a usable MTP mount.
+
+    No kernel audit privileges or serial-number access is required. Cannot
+    diagnose the cable or classify kernel USB enumeration errors.
+    """
+    if IS_DARWIN:
+        return "unsupported"
+    try:
+        devices = list(root.iterdir())
+    except OSError:
+        return "unavailable"
+    preboot = other = unreadable = False
+    for device in devices:
+        if not (device / "idVendor").is_file():
+            continue
+        try:
+            vendor = (device / "idVendor").read_text().strip().casefold()
+        except OSError:
+            unreadable = True
+            continue
+        if vendor != "091e":
+            continue
+        try:
+            product = (device / "idProduct").read_text().strip().casefold()
+        except OSError:
+            unreadable = True
+            continue
+        if product == "51b5":
+            return "fenix_usb"
+        if product == "0003":
+            preboot = True
+        else:
+            other = True
+    if preboot:
+        return "garmin_preboot_usb"
+    if other:
+        return "other_garmin_usb"
+    return "unavailable" if unreadable else "absent"
+
+
+class DiscoveryTelemetry:
+    """Transition-only USB/MTP logs with periodic scan freshness telemetry."""
+    USB_PRESENT = frozenset(("fenix_usb", "garmin_preboot_usb", "other_garmin_usb"))
+
+    def __init__(self, state, clock=time.monotonic, timestamp=now):
+        self.state = state
+        self.clock = clock
+        self.timestamp = timestamp
+        self.previous = None
+        self.transitions = 0
+        self.usb_only_since = None
+        self.state.update(discovery_state="unknown", usb_state="unavailable",
+                          discovery_last_scan_at=None, discovery_transitions=0)
+
+    def observe(self, usb_state, mounted):
+        phase = ("mtp_mounted" if mounted else "usb_present_mtp_missing"
+                 if usb_state in self.USB_PRESENT else "not_mounted")
+        current = (usb_state, phase)
+        timestamp = self.timestamp()
+        elapsed = None
+        if phase == "usb_present_mtp_missing":
+            if self.usb_only_since is None:
+                self.usb_only_since = self.clock()
+        elif phase == "mtp_mounted":
+            if self.usb_only_since is not None:
+                elapsed = max(0, round(self.clock() - self.usb_only_since, 3))
+            self.usb_only_since = None
+        else:
+            self.usb_only_since = None
+        fields = {"discovery_last_scan_at": timestamp}
+        if current != self.previous:
+            self.transitions += 1
+            fields.update(discovery_state=phase, usb_state=usb_state,
+                          discovery_transition_at=timestamp,
+                          discovery_transitions=self.transitions)
+            if elapsed is not None:
+                fields["usb_to_mtp_recovery_seconds"] = elapsed
+            log("discovery_transition", usb_state=usb_state, discovery_state=phase,
+                transitions=self.transitions, usb_to_mtp_recovery_seconds=elapsed)
+        self.state.update(**fields)
+        self.previous = current
 
 
 class Busy(Exception):
@@ -941,6 +1032,7 @@ def daemon(state):
         return runner
 
     controller = Controller(state, launch)
+    telemetry = DiscoveryTelemetry(state)
 
     def mounts():
         return native_mount_paths(monitor.get_mounts())
@@ -949,6 +1041,7 @@ def daemon(state):
         pin = enrolled_device()
         if not pin:
             controller.observe(None)
+            telemetry.observe(linux_garmin_usb_probe(), mounted=False)
             state.update(status="unenrolled", detected=False, source=None,
                          enrolled=False, last_error="No Garmin device is enrolled")
             return True
@@ -956,12 +1049,14 @@ def daemon(state):
             source = discover(mounts(), expected_identity=pin["identity"])
         except DiscoveryError as exc:
             controller.observe(None)
+            telemetry.observe(linux_garmin_usb_probe(), mounted=False)
             state.update(status="blocked", detected=False, source=None,
                          enrolled=True, last_error=str(exc))
             log("discovery_blocked", error=str(exc))
             return True
         state.update(enrolled=True)
         controller.observe(source)
+        telemetry.observe(linux_garmin_usb_probe(), mounted=bool(source))
         return True
 
     def mount_removed(_, mount):
