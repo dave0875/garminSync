@@ -691,6 +691,39 @@ def representative_files(inventory):
     return selected
 
 
+def latest_activity_fit(inventory):
+    """Select a verified Activity FIT candidate with explicit ordering provenance."""
+    candidates = []
+    for item in inventory:
+        path = item.get("Path", "")
+        if not re.fullmatch(r"Activity/.+\.fit", path, re.IGNORECASE):
+            continue
+        filename = Path(path).name
+        match = re.fullmatch(r"(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.fit",
+                             filename, re.IGNORECASE)
+        stamp = None
+        if match:
+            try:
+                stamp = dt.datetime.strptime(match.group(1), "%Y-%m-%d-%H-%M-%S")
+            except ValueError:
+                pass
+        modtime = item.get("ModTime") or ""
+        if stamp is not None:
+            order = (2, stamp.isoformat(), path.casefold())
+            method = "filename_timestamp"
+        elif modtime:
+            order = (1, str(modtime), path.casefold())
+            method = "modtime_fallback"
+        else:
+            order = (0, "", path.casefold())
+            method = "path_fallback"
+        candidates.append((order, path, method))
+    if not candidates:
+        return None
+    _, path, method = max(candidates)
+    return {"relative_path": path, "selection_basis": method}
+
+
 def mount_matches_source(mount, source):
     root = mount.get_root()
     path = root.get_path()
@@ -835,10 +868,26 @@ class SyncRun:
             warnings = self.inspect_fits(source, before, stderr) if self.inspect else []
             if self.runner.cancellation.is_set() or model_at(Path(source)) != original_device:
                 raise Cancelled("Device disconnected during FIT inspection")
-            log("verified", run_id=run_id, files=len(before), copied=copied, fit_warnings=warnings)
+            verified_at = now()
+            candidate = latest_activity_fit(before)
+            activity = None
+            if candidate:
+                activity = {**candidate, "run_id": run_id, "verified_at": verified_at,
+                            "destination_path": self.destination.rstrip("/") + "/" +
+                            candidate["relative_path"], "mode": mode,
+                            "verification": "rclone_check_one_way_and_source_identity"}
+                # Verification-only probes report provenance, but do not promote a new
+                # authoritative copy success in persistent state.
+                if mode == "copy":
+                    self.update(last_verified_activity=activity)
+                log("activity_verified", **activity)
+            log("verified", run_id=run_id, files=len(before), copied=copied,
+                activity=activity["relative_path"] if activity else None,
+                fit_warnings=warnings)
             return {"mode": mode, "considered": len(before), "copied": copied,
                     "verified": len(before), "archive": archive if mode == "copy" else None,
-                    "fit_warnings": warnings, "verified_at": now()}
+                    "fit_warnings": warnings, "verified_at": verified_at,
+                    "verified_activity": activity}
 
     def inspect_fits(self, source, inventory, stderr):
         files = representative_files(inventory)
@@ -1407,6 +1456,7 @@ def main(argv=None):
             payload["healthy"] = bool(
                 payload["enrollment"] and Path(RCLONE).is_file() and
                 all(Path(tool).is_file() for tool in payload["mtp_tools"]))
+            payload["last_verified_activity"] = payload["state"].get("last_verified_activity")
             payload["sync_health"] = assess_sync_health(
                 payload["state"], enrolled=bool(payload["enrollment"]))
             print(json.dumps(payload, indent=2))
@@ -1415,6 +1465,7 @@ def main(argv=None):
         healthy_states = {"waiting", "connected", "success", "retry_wait", "copy", "verifying", "dry-run"}
         healthy = ready and bool(payload["enrollment"]) and payload["state"].get("status") in healthy_states
         payload["healthy"] = bool(healthy)
+        payload["last_verified_activity"] = payload["state"].get("last_verified_activity")
         payload["sync_health"] = assess_sync_health(
             payload["state"], enrolled=bool(payload["enrollment"]), service_ready=ready)
         print(json.dumps(payload, indent=2))
