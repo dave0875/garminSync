@@ -397,6 +397,63 @@ OK.
             state.update(status="failed")
             self.assertEqual(sync.State(path).snapshot()["last_success"], "previous")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+    def test_sync_health_does_not_conflate_daemon_and_verified_backup(self):
+        base = {"status": "waiting", "source": None, "detected": False,
+                "last_success": "2026-10-10T06:21:51+00:00",
+                "connection_token": 1, "verified_connection_token": 1}
+        waiting = sync.assess_sync_health(base, enrolled=True, service_ready=True)
+        self.assertEqual(waiting["state"], "waiting_for_device")
+        self.assertFalse(waiting["verified_current_connection"])
+        connected = {**base, "status": "connected", "detected": True,
+                     "source": "/device/GARMIN", "verified_connection_token": None}
+        self.assertEqual(sync.assess_sync_health(connected, enrolled=True)["state"],
+                         "connected_unverified")
+        self.assertEqual(sync.assess_sync_health({**connected, "status": "copy"},
+                                                enrolled=True)["state"], "syncing")
+        verified = {**connected, "status": "success", "verified_connection_token": 1}
+        self.assertEqual(sync.assess_sync_health(verified, enrolled=True)["state"], "synced")
+        self.assertEqual(sync.assess_sync_health({**verified, "status": "retry_wait",
+                                                "last_error": "copy failed"},
+                                                enrolled=True)["state"], "degraded")
+        self.assertEqual(sync.assess_sync_health(verified, enrolled=True,
+                                                 service_ready=False)["state"], "degraded")
+        self.assertEqual(sync.assess_sync_health(verified, enrolled=False)["state"], "degraded")
+
+    def test_sync_health_session_marker_resets_after_reconnect_and_restart(self):
+        with tempfile.TemporaryDirectory() as name:
+            state = sync.State(Path(name) / "state.json")
+            workers = []
+            def launch(source, mode, epoch, complete):
+                workers.append((mode, epoch, complete))
+                return Worker()
+            controller = sync.Controller(state, launch)
+            controller.observe(DEVICE)
+            mode, epoch, complete = workers[-1]
+            complete(epoch, mode, {"verified": 10, "copied": 1})
+            snapshot = state.snapshot()
+            self.assertEqual(snapshot["verified_connection_token"], epoch)
+            self.assertTrue(sync.assess_sync_health(snapshot, enrolled=True)
+                            ["verified_current_connection"])
+            controller.observe(None)
+            controller.observe(DEVICE)
+            self.assertFalse(sync.assess_sync_health(state.snapshot(), enrolled=True)
+                             ["verified_current_connection"])
+            restarted = sync.Controller(state, launch)
+            self.assertIsNone(state.snapshot()["verified_connection_token"])
+            self.assertEqual(state.snapshot()["last_success"], snapshot["last_success"])
+            self.assertFalse(sync.assess_sync_health(state.snapshot(), enrolled=True)
+                             ["verified_current_connection"])
+            restarted.stop()
+
+    def test_persistent_sync_health_tracks_device_absence(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "state.json"
+            state = sync.State(path)
+            state.update(enrolled=True, detected=False, source=None,
+                         status="waiting", last_success="previous")
+            self.assertEqual(sync.State(path).snapshot()["sync_health"]["state"],
+                             "waiting_for_device")
+
     def test_conflicting_autostarts_detects_renamed_legacy_launcher(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
