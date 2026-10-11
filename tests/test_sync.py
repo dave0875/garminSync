@@ -454,6 +454,52 @@ OK.
             self.assertEqual(sync.State(path).snapshot()["sync_health"]["state"],
                              "waiting_for_device")
 
+    def test_linux_usb_sysfs_probe_identifies_transient_and_mtp(self):
+        with tempfile.TemporaryDirectory() as name, mock.patch.object(sync, "IS_DARWIN", False):
+            root = Path(name)
+            other = root / "other"
+            other.mkdir()
+            (other / "idVendor").write_text("046d\\n")
+            (other / "idProduct").write_text("c52b\\n")
+            self.assertEqual(sync.linux_usb_presence(root), "absent")
+            device = root / "device"
+            device.mkdir()
+            (device / "idVendor").write_text("091e\\n")
+            (device / "idProduct").write_text("0003\\n")
+            self.assertEqual(sync.linux_usb_presence(root), "garmin_transient")
+            (device / "idProduct").write_text("51b5\\n")
+            self.assertEqual(sync.linux_usb_presence(root), "fenix_mtp_interface")
+            (device / "idProduct").unlink()
+            self.assertEqual(sync.linux_usb_presence(root), "absent")
+            self.assertEqual(sync.linux_usb_presence(root / "missing"), "unavailable")
+
+    def test_usb_health_observer_logs_transitions_and_bounded_mount_delay(self):
+        with tempfile.TemporaryDirectory() as name:
+            state = sync.State(Path(name) / "state.json")
+            moment = [0.0]
+            observer = sync.UsbHealthObserver(state, clock=lambda: moment[0],
+                                              grace_seconds=120)
+            with mock.patch.object(sync, "log") as event:
+                observer.observe("absent", False)
+                observer.observe("absent", False)
+                self.assertEqual(event.call_count, 1)
+                observer.observe("garmin_transient", False)
+                observer.observe("fenix_mtp_interface", False)
+                moment[0] = 119
+                observer.observe("fenix_mtp_interface", False)
+                self.assertFalse(state.snapshot()["mtp_mount_delayed"])
+                moment[0] = 120
+                observer.observe("fenix_mtp_interface", False)
+                observer.observe("fenix_mtp_interface", False)
+                self.assertTrue(state.snapshot()["mtp_mount_delayed"])
+                self.assertEqual(sum(x.args[0] == "mtp_mount_delayed"
+                                     for x in event.call_args_list), 1)
+                observer.observe("fenix_mtp_interface", True)
+                self.assertFalse(state.snapshot()["mtp_mount_delayed"])
+                self.assertEqual(sync.assess_sync_health(
+                    {"status": "waiting", "detected": False, "mtp_mount_delayed": True},
+                    enrolled=True)["state"], "degraded")
+
     def test_conflicting_autostarts_detects_renamed_legacy_launcher(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)

@@ -192,6 +192,26 @@ run are **not** evidence that a newly connected watch or activity is backed up.
 plugged-in device. The `healthy` field preserves backward-compatible service
 semantics; use `sync_health.state` when deciding whether an activity is backed up.
 
+## Linux USB/MTP troubleshooting
+
+On GORF, the daemon now reconciles **read-only** Linux sysfs descriptors at
+`/sys/bus/usb/devices` alongside the existing Gio/MTP mount events and 60-second
+mount scan. `usb_state_changed` appears only on state transitions. The structured
+`status` state includes `usb_state`, `mtp_mounted`, and `mtp_mount_delayed`:
+
+- `absent`: no visible Garmin USB device; check data cable, connector, and port.
+- `garmin_transient`: the `091e:0003` interface is visible, but not the expected MTP interface.
+- `fenix_mtp_interface`: Linux can see `091e:51b5`; MTP mount can still lag.
+- `unavailable`: sysfs probe unavailable, not evidence of disconnection.
+
+A stable Fenix USB interface without its mounted Garmin source for at least
+120 seconds emits one `mtp_mount_delayed` event until the state changes.
+Kernel-level enumeration failures that never produce a sysfs entry **cannot**
+be diagnosed by this observer. For physical enumeration failures use
+`sudo journalctl -k -f`, `lsusb -d 091e:`, and check your cable/port.
+The daemon never resets USB devices, reads privileged kernel logs, or
+changes the existing enrolled-device verification.
+
 ## Operator commands
 
 The commands below are Linux/GORF service operations unless noted. On macOS use

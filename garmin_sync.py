@@ -101,6 +101,58 @@ def private_dir(path):
     return path
 
 
+def linux_usb_presence(sysfs_root=Path("/sys/bus/usb/devices")):
+    """Best-effort sysfs observation; cannot detect USB enumeration failures."""
+    if IS_DARWIN:
+        return "unavailable"
+    try:
+        devices = list(sysfs_root.iterdir())
+    except OSError:
+        return "unavailable"
+    transient = False
+    for device in devices:
+        try:
+            vendor = (device / "idVendor").read_text().strip().lower()
+            if vendor != "091e":
+                continue
+            product = (device / "idProduct").read_text().strip().lower()
+        except OSError:
+            continue
+        if product == "51b5":
+            return "fenix_mtp_interface"
+        if product == "0003":
+            transient = True
+    return "garmin_transient" if transient else "absent"
+
+
+class UsbHealthObserver:
+    """Transition-only USB and GVFS diagnostics, without privileged kernel logs."""
+    def __init__(self, state, clock=time.monotonic, grace_seconds=120):
+        self.state = state
+        self.clock = clock
+        self.grace_seconds = grace_seconds
+        self.last = None
+        self.changed_at = None
+        self.warned = False
+
+    def observe(self, usb_state, mtp_mounted):
+        condition = (usb_state, bool(mtp_mounted))
+        moment = self.clock()
+        if condition != self.last:
+            self.last = condition
+            self.changed_at = moment
+            self.warned = False
+            log("usb_state_changed", usb_state=usb_state, mtp_mounted=bool(mtp_mounted))
+        if (usb_state == "fenix_mtp_interface" and not mtp_mounted and
+                not self.warned and moment - self.changed_at >= self.grace_seconds):
+            self.warned = True
+            log("mtp_mount_delayed", usb_state=usb_state,
+                seconds_without_mount=int(moment - self.changed_at))
+        self.state.update(usb_state=usb_state, usb_checked_at=now(),
+                          mtp_mounted=bool(mtp_mounted),
+                          mtp_mount_delayed=self.warned)
+
+
 def assess_sync_health(state, enrolled=None, service_ready=None):
     """Operational backup state; never conflate process readiness with verified data."""
     status = state.get("status", "idle")
@@ -111,6 +163,8 @@ def assess_sync_health(state, enrolled=None, service_ready=None):
     base = {"last_success": state.get("last_success"),
             "connection_changed_at": state.get("connection_changed_at"),
             "detected": detected, "last_error": state.get("last_error"),
+            "usb_state": state.get("usb_state"), "mtp_mounted": state.get("mtp_mounted"),
+            "mtp_mount_delayed": state.get("mtp_mount_delayed", False),
             "retry_at": state.get("retry_at"),
             "verified_current_connection": bool(verified_current)}
     if enrolled is False or status == "unenrolled":
@@ -119,6 +173,8 @@ def assess_sync_health(state, enrolled=None, service_ready=None):
         level, reason = "degraded", "daemon not ready (service or process mismatch)"
     elif status in ("failed", "blocked", "retry_wait", "stopped", "stopping"):
         level, reason = "degraded", state.get("last_error") or "synchronization failed or is blocked"
+    elif not detected and state.get("mtp_mount_delayed"):
+        level, reason = "degraded", "Fenix USB present but MTP mount unavailable beyond grace period"
     elif not detected:
         level, reason = "waiting_for_device", "no mounted enrolled Fenix 8; previous success is historical"
     elif status in ("copy", "verifying", "dry-run"):
@@ -926,6 +982,7 @@ def daemon(state):
         return runner
 
     controller = Controller(state, launch)
+    usb_health = UsbHealthObserver(state)
 
     def mounts():
         return native_mount_paths(monitor.get_mounts())
@@ -941,11 +998,13 @@ def daemon(state):
             source = discover(mounts(), expected_identity=pin["identity"])
         except DiscoveryError as exc:
             controller.observe(None)
+            usb_health.observe(linux_usb_presence(), False)
             state.update(status="blocked", detected=False, source=None,
                          enrolled=True, last_error=str(exc))
             log("discovery_blocked", error=str(exc))
             return True
         state.update(enrolled=True)
+        usb_health.observe(linux_usb_presence(), bool(source))
         controller.observe(source)
         return True
 
