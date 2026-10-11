@@ -101,6 +101,35 @@ def private_dir(path):
     return path
 
 
+def assess_sync_health(state, enrolled=None, service_ready=None):
+    """Operational backup state; never conflate process readiness with verified data."""
+    status = state.get("status", "idle")
+    detected = bool(state.get("detected")) and bool(state.get("source"))
+    verified_current = (detected and state.get("connection_token") is not None and
+                        state.get("verified_connection_token") ==
+                        state.get("connection_token"))
+    base = {"last_success": state.get("last_success"),
+            "connection_changed_at": state.get("connection_changed_at"),
+            "detected": detected, "last_error": state.get("last_error"),
+            "retry_at": state.get("retry_at"),
+            "verified_current_connection": bool(verified_current)}
+    if enrolled is False or status == "unenrolled":
+        level, reason = "degraded", "no enrolled Fenix 8; enrollment required"
+    elif service_ready is False:
+        level, reason = "degraded", "daemon not ready (service or process mismatch)"
+    elif status in ("failed", "blocked", "retry_wait", "stopped", "stopping"):
+        level, reason = "degraded", state.get("last_error") or "synchronization failed or is blocked"
+    elif not detected:
+        level, reason = "waiting_for_device", "no mounted enrolled Fenix 8; previous success is historical"
+    elif status in ("copy", "verifying", "dry-run"):
+        level, reason = "syncing", "current device is being processed; verification pending"
+    elif verified_current:
+        level, reason = "synced", "current mount session completed a verified copy"
+    else:
+        level, reason = "connected_unverified", "device mounted; current session not yet verified"
+    return {"state": level, "reason": reason, **base}
+
+
 class State:
     def __init__(self, path=STATE_PATH):
         self.path = path
@@ -108,7 +137,8 @@ class State:
         self.data = {"version": VERSION, "status": "idle", "source": None,
                      "detected": False, "considered": 0, "copied": 0,
                      "verified": 0, "archive": None, "last_success": None,
-                     "fit_warnings": []}
+                     "fit_warnings": [], "connection_token": None,
+                     "verified_connection_token": None, "sync_health": None}
         try:
             previous = json.loads(path.read_text())
             self.data.update(previous)
@@ -123,6 +153,8 @@ class State:
             if token is not None and token != self.data.get("connection_token"):
                 return False
             self.data.update(fields)
+            self.data["sync_health"] = assess_sync_health(
+                self.data, enrolled=self.data.get("enrolled"))
             self.data["updated_at"] = now()
             private_dir(self.path.parent)
             fd, name = tempfile.mkstemp(prefix=".state-", dir=self.path.parent)
@@ -788,7 +820,8 @@ class Controller:
         self.failures = 0
         self.stopping = False
         self.state.update(status="waiting", source=None, detected=False,
-                          connection_token=0, daemon_started_at=now(),
+                          connection_token=0, verified_connection_token=None,
+                           daemon_started_at=now(),
                           daemon_pid=os.getpid(), build=build_info(),
                           enrolled=bool(enrolled_device()))
 
@@ -807,6 +840,7 @@ class Controller:
             self.state.update(source=source["root"] if source else None,
                               model=source["model"] if source else None,
                               detected=bool(source), connection_token=self.epoch,
+                               verified_connection_token=None,
                               status="connected" if source else "waiting", connection_changed_at=now())
             log("connected" if source else "disconnected", source=source["root"] if source else None)
         self.tick()
@@ -851,7 +885,8 @@ class Controller:
                 self.successful = True
                 self.failures = 0
                 self.retry_at = 0
-                fields.update(last_success=now(), retry_at=None, last_error=None)
+                fields.update(last_success=now(), retry_at=None, last_error=None,
+                              verified_connection_token=self.epoch)
                 fields["last_success_details"] = {**result, "source": self.source["root"],
                                                   "completed_at": fields["last_success"]}
             self.state.update(**fields)
@@ -1313,12 +1348,16 @@ def main(argv=None):
             payload["healthy"] = bool(
                 payload["enrollment"] and Path(RCLONE).is_file() and
                 all(Path(tool).is_file() for tool in payload["mtp_tools"]))
+            payload["sync_health"] = assess_sync_health(
+                payload["state"], enrolled=bool(payload["enrollment"]))
             print(json.dumps(payload, indent=2))
             return 0 if payload["healthy"] else 1
         ready, payload = readiness()
         healthy_states = {"waiting", "connected", "success", "retry_wait", "copy", "verifying", "dry-run"}
         healthy = ready and bool(payload["enrollment"]) and payload["state"].get("status") in healthy_states
         payload["healthy"] = bool(healthy)
+        payload["sync_health"] = assess_sync_health(
+            payload["state"], enrolled=bool(payload["enrollment"]), service_ready=ready)
         print(json.dumps(payload, indent=2))
         return 0 if healthy else 1
     if args.command == "readiness":
