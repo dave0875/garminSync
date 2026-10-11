@@ -143,6 +143,56 @@ class State:
             return dict(self.data)
 
 
+SYNC_FRESHNESS_WINDOW = dt.timedelta(hours=24)
+
+
+def sync_health(state, service_ready, enrolled=True, current_time=None):
+    """Operator-facing backup health, independent of deployment readiness.
+
+    Waiting for a physically absent watch is normal. A successful process
+    launch, proposed transfer, or copied file never counts as verification.
+    """
+    current_time = current_time or dt.datetime.now(dt.timezone.utc)
+    last = state.get("last_success")
+    age = None
+    if last:
+        try:
+            verified_time = dt.datetime.fromisoformat(last.replace("Z", "+00:00"))
+            if verified_time.tzinfo is not None:
+                age = max(0, int((current_time - verified_time).total_seconds()))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    freshness = ("never_verified" if not last else "unknown" if age is None else
+                 "stale" if age > SYNC_FRESHNESS_WINDOW.total_seconds() else "recent")
+    phase = state.get("status") or "unknown"
+    detected = bool(state.get("detected"))
+    if not service_ready:
+        condition = "service_unavailable"
+    elif not enrolled or phase == "unenrolled":
+        condition = "unenrolled"
+    elif phase in ("blocked", "failed", "retry_wait"):
+        condition = "degraded"
+    elif not detected:
+        condition = "waiting_for_device"
+    elif phase in ("copy", "verifying", "dry-run"):
+        condition = "syncing"
+    elif phase == "success" and last:
+        condition = "verified"
+    else:
+        condition = "awaiting_verification"
+    return {
+        "condition": condition,
+        "device_availability": "mounted" if detected else "not_mounted",
+        "phase": phase,
+        "last_verified_backup_at": last,
+        "last_verified_backup_age_seconds": age,
+        "backup_freshness": freshness,
+        "last_error": state.get("last_error"),
+        "last_failure_at": state.get("failed_at"),
+        "last_connection_change_at": state.get("connection_changed_at"),
+    }
+
+
 class Busy(Exception):
     pass
 
@@ -1035,8 +1085,10 @@ def readiness(expected_commit=None):
     if expected_commit:
         ready = ready and build.get("commit") == expected_commit and \
             (state.get("build") or {}).get("commit") == expected_commit
+    enrollment = enrolled_device()
     payload = {"ready": bool(ready), "service": service, "state": state,
-               "build": build, "enrollment": enrolled_device()}
+               "build": build, "enrollment": enrollment,
+               "sync_health": sync_health(state, ready, enrolled=bool(enrollment))}
     return bool(ready), payload
 
 
@@ -1313,6 +1365,8 @@ def main(argv=None):
             payload["healthy"] = bool(
                 payload["enrollment"] and Path(RCLONE).is_file() and
                 all(Path(tool).is_file() for tool in payload["mtp_tools"]))
+            payload["sync_health"] = sync_health(
+                payload["state"], payload["healthy"], enrolled=bool(payload["enrollment"]))
             print(json.dumps(payload, indent=2))
             return 0 if payload["healthy"] else 1
         ready, payload = readiness()
