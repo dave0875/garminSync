@@ -172,6 +172,22 @@ garmin-syncctl enroll --replace
 systemctl --user start garmin-sync.service
 ```
 
+## USB/MTP detection diagnostics (Linux)
+
+GORF's daemon retains its existing GIO mount signals and 60-second fallback scan.
+It also performs a read-only Linux sysfs probe for Garmin USB vendor `091e` and
+tracks state transitions without storing USB serial numbers. The `status`
+`sync_health` object exposes `usb_state`, `discovery_state`,
+`discovery_last_scan_at`, `discovery_transitions`, and (when measured)
+`usb_to_mtp_recovery_seconds`. `fenix_usb` means Linux can enumerate the
+expected vendor/product pair, **not** that MTP is mounted or a backup completed.
+`garmin_preboot_usb` recognizes the transitional `091e:0003` identity;
+`usb_present_mtp_missing` means there is a candidate USB interface but
+no enrolled usable mount. Missing sysfs permissions become `unavailable`,
+not a false report of physical disconnection. Raw kernel/controller errors
+(such as `Cannot enable`) remain in `journalctl -k`; the unprivileged
+user service does not read or claim to diagnose those logs.
+
 ## Archive policy
 
 `gdrive:Garmin/Fenix8_Archive` is preservation storage for overwritten destination objects. The default policy is **preserve indefinitely; no automatic deletion**. `garmin-syncctl doctor` reports the number of top-level archive run directories so growth is visible and can be reviewed manually before any future retention policy is introduced.
