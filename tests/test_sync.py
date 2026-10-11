@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 """Controller regressions and rclone fixtures, using only temporary local backups."""
+import datetime as dt
 import json
 import os
 from pathlib import Path
@@ -107,6 +108,65 @@ class ControllerTests(unittest.TestCase):
         count = len(self.calls)
         self.finish()
         self.assertEqual(len(self.calls), count)
+
+
+class SyncHealthTests(unittest.TestCase):
+    def setUp(self):
+        self.at = dt.datetime(2026, 10, 11, 21, 30, tzinfo=dt.timezone.utc)
+        self.recent = (self.at - dt.timedelta(hours=1)).isoformat()
+        self.stale = (self.at - dt.timedelta(days=3)).isoformat()
+
+    def health(self, **fields):
+        state = {"status": "waiting", "detected": False, "last_success": None}
+        state.update(fields)
+        return sync.sync_health(state, True, current_time=self.at)
+
+    def test_disconnected_healthy_daemon_is_not_verified_backup(self):
+        health = self.health(status="waiting", last_success=self.stale)
+        self.assertEqual(health["condition"], "waiting_for_device")
+        self.assertEqual(health["device_availability"], "not_mounted")
+        self.assertEqual(health["backup_freshness"], "stale")
+        self.assertEqual(health["last_verified_backup_age_seconds"], 3 * 86400)
+
+    def test_connected_preverification_and_active_copy_not_success(self):
+        self.assertEqual(self.health(detected=True, status="connected",
+                                     last_success=self.recent)["condition"],
+                         "awaiting_verification")
+        self.assertEqual(self.health(detected=True, status="copy")["condition"], "syncing")
+        self.assertEqual(self.health(detected=True, status="verifying")["condition"], "syncing")
+
+    def test_only_verified_completed_run_reports_verified(self):
+        health = self.health(detected=True, status="success", last_success=self.recent)
+        self.assertEqual(health["condition"], "verified")
+        self.assertEqual(health["backup_freshness"], "recent")
+        self.assertEqual(health["last_verified_backup_age_seconds"], 3600)
+
+    def test_retry_failure_blocked_and_service_down(self):
+        for phase in ("retry_wait", "failed", "blocked"):
+            health = self.health(status=phase, detected=True, last_error="discovery failed")
+            self.assertEqual(health["condition"], "degraded")
+            self.assertEqual(health["last_error"], "discovery failed")
+        self.assertEqual(sync.sync_health({"status": "waiting"}, False)["condition"],
+                         "service_unavailable")
+        self.assertEqual(sync.sync_health({"status": "unenrolled"}, True, enrolled=False)
+                         ["condition"], "unenrolled")
+
+    def test_invalid_historical_timestamp_has_unknown_freshness(self):
+        result = self.health(last_success="previous")
+        self.assertIsNone(result["last_verified_backup_age_seconds"])
+        self.assertEqual(result["backup_freshness"], "unknown")
+
+    def test_status_reports_separate_operational_and_backup_health(self):
+        payload = {"service": {"ActiveState": "active", "MainPID": "1"},
+                   "state": {"status": "waiting", "detected": False,
+                             "last_success": self.stale},
+                   "build": {"commit": "test"}, "enrollment": {"identity": "hash"}}
+        with mock.patch.object(sync, "readiness", return_value=(True, payload)), \
+             mock.patch("builtins.print") as printed:
+            self.assertEqual(sync.main(["status"]), 0)
+        output = json.loads(printed.call_args.args[0])
+        self.assertTrue(output["healthy"])
+        self.assertEqual(output["sync_health"]["condition"], "waiting_for_device")
 
 class BasicTests(unittest.TestCase):
     def setUp(self):
