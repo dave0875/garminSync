@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Copy and verify native files from a physically mounted fenix 8."""
+"""Preserve native files from an explicitly enrolled Garmin USB/MTP device."""
 
 import argparse
 import contextlib
@@ -56,7 +56,6 @@ MTP_CONNECT = resolve_executable(
     "/opt/homebrew/bin/mtp-connect")
 IOREG = "/usr/sbin/ioreg"
 GARMIN_USB_VENDOR_ID = 0x091E
-FENIX8_USB_PRODUCT_ID = 0x51B5
 MACOS_LAUNCHD_LABEL = "com.dave0875.garmin-sync"
 RUNTIME = (Path.home() / "Library/Caches/garmin-sync" if IS_DARWIN
            else Path(f"/run/user/{os.getuid()}/garmin-sync"))
@@ -110,6 +109,7 @@ def linux_usb_presence(sysfs_root=Path("/sys/bus/usb/devices")):
     except OSError:
         return "unavailable"
     transient = False
+    garmin_mtp = False
     for device in devices:
         try:
             vendor = (device / "idVendor").read_text().strip().lower()
@@ -119,10 +119,13 @@ def linux_usb_presence(sysfs_root=Path("/sys/bus/usb/devices")):
         except OSError:
             continue
         if product == "51b5":
-            return "fenix_mtp_interface"
+            return "fenix_mtp_interface"  # Retain legacy telemetry for GORF dashboards.
         if product == "0003":
             transient = True
-    return "garmin_transient" if transient else "absent"
+        else:
+            garmin_mtp = True
+    return ("garmin_mtp_interface" if garmin_mtp else
+            "garmin_transient" if transient else "absent")
 
 
 class UsbHealthObserver:
@@ -143,7 +146,7 @@ class UsbHealthObserver:
             self.changed_at = moment
             self.warned = False
             log("usb_state_changed", usb_state=usb_state, mtp_mounted=bool(mtp_mounted))
-        if (usb_state == "fenix_mtp_interface" and not mtp_mounted and
+        if (usb_state in ("fenix_mtp_interface", "garmin_mtp_interface") and not mtp_mounted and
                 not self.warned and moment - self.changed_at >= self.grace_seconds):
             self.warned = True
             log("mtp_mount_delayed", usb_state=usb_state,
@@ -168,15 +171,15 @@ def assess_sync_health(state, enrolled=None, service_ready=None):
             "retry_at": state.get("retry_at"),
             "verified_current_connection": bool(verified_current)}
     if enrolled is False or status == "unenrolled":
-        level, reason = "degraded", "no enrolled Fenix 8; enrollment required"
+        level, reason = "degraded", "no enrolled Garmin device; enrollment required"
     elif service_ready is False:
         level, reason = "degraded", "daemon not ready (service or process mismatch)"
     elif status in ("failed", "blocked", "retry_wait", "stopped", "stopping"):
         level, reason = "degraded", state.get("last_error") or "synchronization failed or is blocked"
     elif not detected and state.get("mtp_mount_delayed"):
-        level, reason = "degraded", "Fenix USB present but MTP mount unavailable beyond grace period"
+        level, reason = "degraded", "Garmin USB present but MTP mount unavailable beyond grace period"
     elif not detected:
-        level, reason = "waiting_for_device", "no mounted enrolled Fenix 8; previous success is historical"
+        level, reason = "waiting_for_device", "no mounted enrolled Garmin device; previous success is historical"
     elif status in ("copy", "verifying", "dry-run"):
         level, reason = "syncing", "current device is being processed; verification pending"
     elif verified_current:
@@ -314,7 +317,7 @@ def model_at(root):
         description = next((node.text or "" for node in tree.iter()
                             if node.tag.rsplit("}", 1)[-1] == "Description"), "")
         model = unicodedata.normalize("NFKD", description).encode("ascii", "ignore").decode()
-        if not re.match(r"fenix\s*8(?:\D|$)", model, re.IGNORECASE):
+        if not model.strip():
             return None
         identity = next((node.text or "" for node in tree.iter()
                          if node.tag.rsplit("}", 1)[-1] == "Id"), "").strip()
@@ -368,11 +371,11 @@ def discover(mount_paths=(), uid=None, username=None, expected_identity=None):
                 found.append(item)
     if len(found) > 1:
         log("multiple_devices", sources=[item["root"] for item in found])
-        raise DiscoveryError("Multiple fenix 8 devices detected; connect only the enrolled watch")
+        raise DiscoveryError("Multiple Garmin devices detected; connect only the enrolled device")
     if expected_identity:
         if found and found[0]["identity"] != expected_identity:
             log("untrusted_device", source=found[0]["root"])
-            raise DiscoveryError("Connected fenix 8 is not the enrolled device")
+            raise DiscoveryError("Connected Garmin device is not the enrolled device")
         return found[0] if found else None
     return found[0] if found else None
 
@@ -559,7 +562,7 @@ def download_mtp_entries(entries, garmin_root, runner, stderr, max_items=1024,
 
 @contextlib.contextmanager
 def stage_macos_device(expected_identity=None, metadata_only=False, runner=None):
-    """Materialize a verified read-only snapshot of a Fenix MTP filesystem."""
+    """Materialize a verified read-only snapshot of an enrolled Garmin MTP filesystem."""
     if not IS_DARWIN:
         raise DiscoveryError("The libmtp staging transport is only used on macOS")
     runner = runner or Runner()
@@ -583,9 +586,9 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
             seconds=round(time.monotonic() - download_started, 3))
         device = model_at(garmin_root)
         if not device:
-            raise DiscoveryError("Connected MTP device is not a Fenix 8 with a valid GarminDevice.xml")
+            raise DiscoveryError("Connected MTP device lacks a valid GarminDevice.xml")
         if expected_identity and device["identity"] != expected_identity:
-            raise DiscoveryError("Connected fenix 8 is not the enrolled device")
+            raise DiscoveryError("Connected Garmin device is not the enrolled device")
         if not metadata_only:
             reinventory_started = time.monotonic()
             after = mtp_inventory(runner, stderr)
@@ -597,7 +600,7 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
             final_device = model_at(garmin_root)
             if final_device != device:
                 raise Cancelled("Device identity changed during MTP staging")
-        device["display_source"] = "mtp:Garmin/fenix8"
+        device["display_source"] = "mtp:Garmin/" + device["model"]
         device["transport"] = "libmtp"
         yield device
 
@@ -1320,8 +1323,8 @@ def _walk_plist(value):
             yield from _walk_plist(child)
 
 
-def fenix_present_in_ioreg(data):
-    """Return True when the enrolled Fenix USB model is visible in an IORegistry plist."""
+def garmin_present_in_ioreg(data):
+    """Return True when a Garmin USB product is visible; enrollment is checked at MTP."""
     try:
         tree = plistlib.loads(data)
     except (plistlib.InvalidFileException, ValueError, TypeError) as exc:
@@ -1329,14 +1332,8 @@ def fenix_present_in_ioreg(data):
     for node in _walk_plist(tree):
         vendor = _integer_property(node.get("idVendor"))
         product = _integer_property(node.get("idProduct"))
-        if vendor == GARMIN_USB_VENDOR_ID and product == FENIX8_USB_PRODUCT_ID:
+        if vendor == GARMIN_USB_VENDOR_ID and product is not None and product != 0x0003:
             return True
-        if vendor == GARMIN_USB_VENDOR_ID:
-            product_name = " ".join(
-                str(node.get(key, "")) for key in
-                ("USB Product Name", "kUSBProductString", "Product Name", "IORegistryEntryName"))
-            if re.search(r"fenix\s*8", product_name, re.IGNORECASE):
-                return True
     return False
 
 
@@ -1349,7 +1346,7 @@ def macos_launchagent_loaded():
     return result.returncode == 0
 
 
-def macos_fenix_usb_present():
+def macos_garmin_usb_present():
     if not IS_DARWIN:
         return False
     try:
@@ -1362,15 +1359,15 @@ def macos_fenix_usb_present():
         raise CommandFailed(
             "ioreg failed while querying USB devices: " +
             result.stderr.decode("utf-8", errors="replace").strip())
-    return fenix_present_in_ioreg(result.stdout)
+    return garmin_present_in_ioreg(result.stdout)
 
 
 def macos_watch(state, poll_seconds=5, retry_seconds=120, presence=None, stop_event=None):
-    """Sync once per Fenix USB connection; retry failures while still connected."""
+    """Sync once per Garmin USB connection; retry failures while connected."""
     if not IS_DARWIN:
         print("watch is only supported on macOS", file=sys.stderr)
         return 64
-    presence = presence or macos_fenix_usb_present
+    presence = presence or macos_garmin_usb_present
     stop_event = stop_event or threading.Event()
     old_handlers = {}
     if threading.current_thread() is threading.main_thread():
@@ -1394,8 +1391,7 @@ def macos_watch(state, poll_seconds=5, retry_seconds=120, presence=None, stop_ev
                 connected = True
                 synced = False
                 retry_at = 0.0
-                log("usb_connected", vendor_id=hex(GARMIN_USB_VENDOR_ID),
-                    product_id=hex(FENIX8_USB_PRODUCT_ID))
+                log("usb_connected", vendor_id=hex(GARMIN_USB_VENDOR_ID))
             elif not present and connected:
                 connected = False
                 synced = False
