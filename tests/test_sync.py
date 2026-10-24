@@ -263,12 +263,14 @@ OK.
                  "USB Product Name": "fenix 8 - 51mm"},
             ]
         }]
-        self.assertTrue(sync.fenix_present_in_ioreg(plistlib.dumps(fixture)))
+        self.assertTrue(sync.garmin_present_in_ioreg(plistlib.dumps(fixture)))
         fixture[0]["IORegistryEntryChildren"][1]["idProduct"] = 0x9999
         fixture[0]["IORegistryEntryChildren"][1]["USB Product Name"] = "fenix 8 - 51mm"
-        self.assertTrue(sync.fenix_present_in_ioreg(plistlib.dumps(fixture)))
+        self.assertTrue(sync.garmin_present_in_ioreg(plistlib.dumps(fixture)))
         fixture[0]["IORegistryEntryChildren"][1]["USB Product Name"] = "Other Garmin"
-        self.assertFalse(sync.fenix_present_in_ioreg(plistlib.dumps(fixture)))
+        self.assertTrue(sync.garmin_present_in_ioreg(plistlib.dumps(fixture)))
+        fixture[0]["IORegistryEntryChildren"][1]["idProduct"] = 0x0003
+        self.assertFalse(sync.garmin_present_in_ioreg(plistlib.dumps(fixture)))
 
     def test_macos_watch_syncs_once_per_connection_edge(self):
         sequence = iter([False, True, True, False, True, False])
@@ -327,9 +329,11 @@ OK.
             xml.write_text(XML)
             self.assertNotEqual(sync.model_at(root)["identity"], "fixture")
             xml.write_text(XML.replace("FENIX  8", "fenix 80"))
-            self.assertIsNone(sync.model_at(root))
+            self.assertIsNotNone(sync.model_at(root))
             xml.write_text(XML.replace("FENIX  8", "fēnix8"))
             self.assertIsNotNone(sync.model_at(root))
+            xml.write_text(XML.replace("FENIX  8 - 51mm, Solar", "Forerunner 965"))
+            self.assertEqual(sync.model_at(root)["model"], "Forerunner 965")
             xml.write_text("<bad")
             self.assertIsNone(sync.model_at(root))
             xml.write_text(XML.replace("<Id>fixture</Id>", ""))
