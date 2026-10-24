@@ -1,3 +1,5 @@
+> **DESIGN-IN-PROGRESS / NOT FOR PRODUCTION.** The current CLI/manual rclone steps are transitional. Consumer onboarding is specified in [ADR-0001](docs/ADR-0001-consumer-onboarding-google-oauth.md) (#39-#43); draft PR #37 must also fix the rclone archive same-remote incompatibility (#38) before use.
+
 # Garmin Sync: enrolled-device preservation to an identity-bound Google Drive
 
 Native, non-destructive backup for **supported Garmin devices**, not just the Fenix 8.
