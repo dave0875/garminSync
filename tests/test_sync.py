@@ -254,7 +254,7 @@ OK.
             arg_budget=96 * 1024)
         self.assertEqual([len(batch) for batch in constrained], [3, 3, 3, 1])
 
-    def test_macos_ioreg_detects_fenix_usb_device(self):
+    def test_macos_ioreg_detects_other_garmin_models(self):
         import plistlib
         fixture = [{
             "IORegistryEntryChildren": [
@@ -322,7 +322,7 @@ OK.
                 with self.assertRaises(sync.Busy):
                     with sync.RunLocks(runtime, legacy): pass
             with sync.RunLocks(runtime, legacy): pass
-    def test_model_case_spacing_hash_and_wrong_model(self):
+    def test_model_case_spacing_hash_and_arbitrary_garmin_model(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             xml = root / "GarminDevice.xml"
@@ -473,6 +473,8 @@ OK.
             self.assertEqual(sync.linux_usb_presence(root), "garmin_transient")
             (device / "idProduct").write_text("51b5\n")
             self.assertEqual(sync.linux_usb_presence(root), "fenix_mtp_interface")
+            (device / "idProduct").write_text("1234\\n")
+            self.assertEqual(sync.linux_usb_presence(root), "garmin_mtp_interface")
             (device / "idProduct").unlink()
             self.assertEqual(sync.linux_usb_presence(root), "absent")
             self.assertEqual(sync.linux_usb_presence(root / "missing"), "unavailable")
