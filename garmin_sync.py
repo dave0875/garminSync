@@ -1450,6 +1450,19 @@ def macos_watch(state, poll_seconds=5, retry_seconds=120, presence=None, stop_ev
     return 0
 
 
+def configured_target_status():
+    """Local configuration state only; doctor/live sync verify Google identity."""
+    try:
+        profile = backup_target.load_profile()
+        return {"configured": True, "installation_id": profile["installation_id"],
+                "backup_remote": profile["backup_remote"],
+                "archive_remote": profile["archive_remote"],
+                "identity_verified": False,
+                "note": "local configuration only; use doctor for a live identity check"}
+    except (backup_target.BindingError, OSError) as exc:
+        return {"configured": False, "reason": str(exc)}
+
+
 def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1500,9 +1513,10 @@ def main(argv=None):
                 "enrollment": enrolled_device(),
                 "rclone": RCLONE,
                 "mtp_tools": [MTP_FILETREE, MTP_FILES, MTP_CONNECT],
+                "destination_binding": configured_target_status(),
             }
             payload["healthy"] = bool(
-                payload["enrollment"] and Path(RCLONE).is_file() and
+                payload["enrollment"] and payload["destination_binding"]["configured"] and Path(RCLONE).is_file() and
                 all(Path(tool).is_file() for tool in payload["mtp_tools"]))
             payload["last_verified_activity"] = payload["state"].get("last_verified_activity")
             payload["sync_health"] = assess_sync_health(
@@ -1511,7 +1525,10 @@ def main(argv=None):
             return 0 if payload["healthy"] else 1
         ready, payload = readiness()
         healthy_states = {"waiting", "connected", "success", "retry_wait", "copy", "verifying", "dry-run"}
-        healthy = ready and bool(payload["enrollment"]) and payload["state"].get("status") in healthy_states
+        payload["destination_binding"] = configured_target_status()
+        healthy = (ready and bool(payload["enrollment"]) and
+                   payload["destination_binding"]["configured"] and
+                   payload["state"].get("status") in healthy_states)
         payload["healthy"] = bool(healthy)
         payload["last_verified_activity"] = payload["state"].get("last_verified_activity")
         payload["sync_health"] = assess_sync_health(
