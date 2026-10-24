@@ -1,3 +1,5 @@
+> **DESIGN-IN-PROGRESS / NOT FOR PRODUCTION.** This is a legacy/manual transitional configuration guide, **not** the desired consumer installation. Draft PR #37's separate backup/archive remotes are incompatible with rclone's same-remote `--backup-dir` requirement (blocker #38). Do not attempt GORF cutover using this guide until #38 is fixed and reverified. First-party OAuth, Google Picker, automatic remotes and the local setup wizard are specified in [ADR-0001](ADR-0001-consumer-onboarding-google-oauth.md) and tracked by #39-#43.
+
 # Per-installation Garmin Sync setup (Linux or macOS)
 
 The Garmin model is **not** an installation parameter. Any enrolled Garmin device
