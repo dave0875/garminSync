@@ -1283,7 +1283,7 @@ def doctor():
     checks["enrolled_device"] = bool(enrolled_device())
 
     required = ["rclone_binary", "gdrive_configured", "gdrive_available",
-                "fit_sdk", "inspector", "enrolled_device"]
+                "destination_identity_verified", "fit_sdk", "inspector", "enrolled_device"]
     if IS_DARWIN:
         required.append("mtp_tools")
     else:
