@@ -146,12 +146,11 @@ class TargetTests(unittest.TestCase):
         second_conf = second / "rclone.conf"
         other_backup = "completelyOtherBackup123"
         other_archive = "completelyOtherArchive456"
-        second_conf.write_text("[backup]\\ntype=drive\\nroot_folder_id=" +
-                               other_backup + '\\ntoken={"access_token":"third"}\\n' +
-                               "[archive]\\ntype=drive\\nroot_folder_id=" +
-                               other_archive + '\\ntoken={"access_token":"fourth"}\\n')
-        # Replace literal escaped newlines with the actual rclone ini syntax.
-        second_conf.write_text(second_conf.read_text().replace("\\\\n", "\\n"))
+        second_conf.write_text(
+            "[backup]\\ntype=drive\\nroot_folder_id=" + other_backup +
+            '\\ntoken={"access_token":"third"}\\n' +
+            "[archive]\\ntype=drive\\nroot_folder_id=" + other_archive +
+            '\\ntoken={"access_token":"fourth"}\\n')
         second_conf.chmod(0o600)
         other_profile = second / "installation.json"
         other = dict(self.payload, installation_id=str(uuid.uuid4()),
@@ -208,7 +207,7 @@ class TargetTests(unittest.TestCase):
                 "mimeType": target.DRIVE_DIRECTORY,
                 "capabilities": {"canAddChildren": False}}).encode())
         with mock.patch.object(target.subprocess, "run",
-                               return_value=mock.Mock(returncode=0)), \\
+                               return_value=mock.Mock(returncode=0)), \
              mock.patch.object(target.urllib.request, "urlopen", side_effect=refuse):
             with self.assertRaisesRegex(target.BindingError, "not a writable folder"):
                 target.inspect_remotes("rclone", self.conf, "backup", "archive")
