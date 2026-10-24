@@ -147,10 +147,10 @@ class TargetTests(unittest.TestCase):
         other_backup = "completelyOtherBackup123"
         other_archive = "completelyOtherArchive456"
         second_conf.write_text(
-            "[backup]\\ntype=drive\\nroot_folder_id=" + other_backup +
-            '\\ntoken={"access_token":"third"}\\n' +
-            "[archive]\\ntype=drive\\nroot_folder_id=" + other_archive +
-            '\\ntoken={"access_token":"fourth"}\\n')
+            "[backup]\ntype=drive\nroot_folder_id=" + other_backup +
+            '\ntoken={"access_token":"third"}\n' +
+            "[archive]\ntype=drive\nroot_folder_id=" + other_archive +
+            '\ntoken={"access_token":"fourth"}\n')
         second_conf.chmod(0o600)
         other_profile = second / "installation.json"
         other = dict(self.payload, installation_id=str(uuid.uuid4()),
