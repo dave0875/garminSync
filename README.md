@@ -102,9 +102,11 @@ tail -f ~/Library/Logs/garmin-sync/watch.log
 requirement for other users.** Its original Drive locations are
 `Garmin/Fenix8_Backup` and `Garmin/Fenix8_Archive`; they must be preserved.
 
-The guarded GORF deploy script runs only as `dbarker@GORF` and accepts the
-current main SHA after CI. It installs atomically, verifies application
-readiness, and rolls back on failure. The repository's deploy workflow is
+The guarded GORF deploy script runs only as `dbarker@GORF`, and GitHub
+Actions deployment now requires an **explicit owner-triggered manual dispatch**
+on the current main SHA with the `DEPLOY_GORF` confirmation. Ordinary merges
+and branch pushes do not automatically deploy. The script installs atomically,
+verifies application readiness and rolls back on failure. The workflow is
 restricted to the original repository's main branch and a specifically
 labeled GORF runner. Clones/forks do not deploy to GORF.
 
