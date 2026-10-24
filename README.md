@@ -1,264 +1,137 @@
-# Garmin Fenix 8 native sync
+# Garmin Sync: enrolled-device preservation to an identity-bound Google Drive
 
-Native, read-only preservation of a physically connected Garmin Fenix 8 to `gdrive:Garmin/Fenix8_Backup`.
+Native, non-destructive backup for **supported Garmin devices**, not just the Fenix 8.
+The device must expose `GARMIN/GarminDevice.xml` and its native files through
+a supported USB/MTP transport. Enrollment pins its SHA-256 device identity.
+This repository does not use Garmin Connect, Garth, or Garmin's cloud.
+
+**Each installation selects its own Google account and any two existing, writable
+Drive folders for backups and archives.** Names such as `Fenix8_Backup`,
+`Garmin`, or the rclone remote alias `gdrive:` are **not required**.
+No Drive mutation occurs without an explicitly approved, private installation
+profile and live checks of the approved Google principal and both folder IDs.
+
+- [Per-user installation, Drive binding and migration guide](docs/INSTALLATION.md)
+- [GitHub CI/CD workflow](.github/workflows/ci.yml)
+
+## Architecture
 
 ```text
-Linux: Fenix 8 native filesystem -> GVFS/GIO ----------\
-                                                      +-> rclone copy/check -> Google Drive
-macOS: Fenix 8 MTP -> libmtp read-only staging --------/
-                                                      \
-                                                       -> optional official garmin-fit-sdk diagnostics
+Enrolled Garmin with GarminDevice.xml
+  Linux: GVFS/GIO        macOS: read-only libmtp snapshot
+             \             /
+              source inventory + device identity verification
+                              |
+             installed binding + pinned Google permission ID
+                              |
+           independently pinned backup and archive folder IDs
+                              |
+         private rclone credential snapshot + account/folder preflight
+                              |
+                rclone copy --checksum / backup-dir
+                              |
+               rclone check + final Garmin verification
 ```
 
-On macOS the watch is not required to mount beneath `/Volumes`. The libmtp transport
-first materializes a temporary, verified snapshot of the selected `GARMIN` tree. No
-Google Drive mutation begins until staging completes and the enrolled Fenix identity
-has been confirmed.
+The Garmin filesystem is authoritative and read-only. Destination-only files
+remain intact, overwritten destination objects are archived indefinitely by
+default, and FIT decoding is diagnostic only. Maps, firmware/unlock files,
+music, videos and image media are excluded; `Activity`, `Monitor`, `Metrics`,
+`HRVStatus`, `Sleep`, and `Debug/MetricsBackup` are eligible when present.
 
-The device filesystem is authoritative. `rclone copy` is non-destructive: destination-only objects remain, changed destination objects are placed beneath `gdrive:Garmin/Fenix8_Archive`, and the watch is never written to. FIT decoding is post-copy diagnostics; it cannot reject a legitimate native artifact.
+## First-time setup
 
-The backup is bound to an explicitly enrolled Fenix identity. The raw Garmin device ID is never stored; its SHA-256 identity is written to `~/.config/garmin-sync/device.json` with private permissions. An unenrolled, different, or ambiguous Fenix cannot write into the authoritative backup.
-
-## Deliberate exclusions
-
-Maps, unlock/firmware assets, music, video, and image media are excluded. All other native files are considered, including `Debug/MetricsBackup`, `Activity`, `Monitor`, `Metrics`, `HRVStatus`, and `Sleep` whenever present. No Garth, Garmin Connect API, browser authentication, token, cookie, or cloud JSON source is used or included in this project.
-
-## Layout
-
-- `garmin_sync.py` — discovery, locking, raw transport, verification, state.
-- `garmin_fit_inspect.py` — read-only official FIT SDK diagnostics.
-- `systemd/` and `bin/` — Linux user-service and portable operator entry points.
-- `tests/` — controller and local-rclone regression fixtures.
-- `scripts/deploy-gorf.sh` — guarded, atomic per-user deployment for GORF.
-
-Local device data, runtime state, forensic evidence, credentials, and the pre-cutover rollback archive are intentionally excluded from Git.
-
-## Local development and CI
-
-Use Python 3.12+ and rclone:
+Install Python 3.12+, rclone, and the OS-specific USB transport dependencies.
+Linux requires Gio/GVFS; macOS requires libmtp. Install Python requirements with:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
-PYTHONPATH=. python3 -m unittest discover -s tests -v
+PYTHONPATH=. .venv/bin/python -m unittest discover -s tests -v
 ```
 
-CI installs and verifies the tooling used by its static guards, proves the production source contains no cloud-client references, smoke-tests GIO, exercises the checkout's official FIT SDK inspector with valid and corrupt FIT inputs, and runs the local-rclone regression suite. It does not access a watch, Drive, or credentials.
+Before the first `once`/daemon/watch run, complete the instructions in
+[docs/INSTALLATION.md](docs/INSTALLATION.md):
 
-## macOS sync
-
-macOS uses the same archive, checksum verification, identity pinning, exclusions, and
-FIT diagnostics as Linux, but reads the watch through libmtp instead of GVFS. It can
-run manually or under a per-user LaunchAgent that syncs once when the enrolled Fenix 8
-appears on USB, then waits for a physical disconnect before another successful sync can
-be triggered. Failed runs are retried with bounded backoff while the watch remains
-connected.
-
-Prerequisites on a MacPorts system:
+1. Choose or create **your own** Google Drive backup and archive folders.
+2. Create a private, dedicated rclone config with separate folder-rooted OAuth remotes.
+3. Use `inspect-target` to verify the actual Google account and both folder IDs.
+4. Use `bind-target` to record the verified IDs with explicit approval.
+5. Enroll your connected Garmin device using `garmin_sync.py enroll`.
+6. Run `once --dry-run`, then `once`.
 
 ```bash
-sudo port install python312 rclone libmtp
-sudo port select --set python3 python312
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-```
-
-Configure the same Google Drive remote used by production:
-
-```bash
-rclone config
-rclone listremotes
-rclone lsf gdrive:Garmin --max-depth 1
-```
-
-With exactly one Fenix 8 connected over USB/MTP, enroll it once and run a dry-run before
-the first copy:
-
-```bash
-.venv/bin/python garmin_sync.py enroll
+.venv/bin/python garmin_sync.py doctor
 .venv/bin/python garmin_sync.py once --dry-run
 .venv/bin/python garmin_sync.py once
 .venv/bin/python garmin_sync.py verify
 ```
 
-After enrollment, the shorter manual aliases are also available:
+An unknown device, absent private binding, wrong Google identity, mismatched
+folder IDs, or unavailable API fails closed. The program does **not** infer the
+destination from the logged-in user's default rclone remote.
 
-```bash
-.venv/bin/python garmin_sync.py dry-run
-.venv/bin/python garmin_sync.py force
-.venv/bin/python garmin_sync.py status
-```
+## Automatic background sync
 
-### Automatic reconnect sync with launchd
+On Linux, the existing `garmin-sync.service` observes Gio mount events and
+periodic scans. On macOS, the `scripts/install-macos-launchagent.sh`
+installer starts a per-user watch process. Neither changes the selected
+Drive target; both load the same private bound installation.
 
-Install the user LaunchAgent from the checked-out repository:
-
-```bash
-bash scripts/install-macos-launchagent.sh install
-```
-
-The LaunchAgent starts the repository's `.venv/bin/python garmin_sync.py watch` process
-at login and keeps it running. The watcher checks the macOS USB registry without opening
-MTP. When a Fenix 8 USB connection appears, it acquires the normal process lock and runs
-one guarded copy. The existing enrollment check still verifies the actual watch identity
-before any Drive mutation.
-
-Useful operations:
-
-```bash
-bash scripts/install-macos-launchagent.sh status
-tail -f ~/Library/Logs/garmin-sync/watch.log
-bash scripts/install-macos-launchagent.sh uninstall
-```
-
-After updating the repository or virtualenv, reinstalling the LaunchAgent is safe and
-restarts it against the current checkout:
-
-```bash
-git pull origin main
-bash scripts/install-macos-launchagent.sh install
-```
-
-The macOS transport invokes only the read side of libmtp. It inventories the device
-with `mtp-filetree` and `mtp-files`, then downloads selected objects with repeated
-`mtp-connect --getfile` operations packed into as few safe command sessions as the
-macOS argv budget allows. This matters because each `mtp-connect` process establishes a
-new libmtp session and device listing. Every staged object still receives an exact-size
-check, and the watch is re-inventoried after staging before Drive is touched.
-
-Because the staged snapshot is immutable for the lifetime of the run, the macOS copy
-path skips the additional pre-copy Drive dry-run used for Linux's live mounted source.
-Snapshot copy/check operations use rclone's bulk destination listing path rather than
-`--no-traverse`, reducing Google Drive API chatter when hundreds of files are unchanged.
-Archive-before-overwrite, checksum comparison, the final `rclone check`, identity
-pinning, post-stage MTP consistency verification, and FIT diagnostics remain in place.
-Explicit `once --dry-run` still performs a single read-only Drive comparison. Maps,
-firmware/unlock assets, music, video, and images remain excluded exactly as on Linux.
-
-## GORF deployment
-
-Deployments occur only from the current `main` revision, after CI, on a runner labeled `self-hosted`, `Linux`, `X64`, `gorf`, and `garmin-sync`. The deploy script is guarded to run only as `dbarker` on host `GORF`, verifies that the checkout SHA is still the current GitHub `main` SHA, and refuses stale workflow runs.
-
-The deployer compares the candidate runtime with the installed runtime. Documentation-only and runner-only changes do not restart `garmin-sync.service`. A real runtime/dependency change is snapshotted beneath `~/.local/bin/garmin-retired/deploy-<UTC>/`, installed atomically, stamped in `~/.local/bin/garmin-sync/build.json`, and accepted only after application-level PID/build readiness matches the deployed commit. The one-time migration also archives and removes the retired `~/.config/autostart/garmin-sync.desktop` launcher so systemd is the sole automatic owner. Deployment never invokes rclone against the watch.
-
-The existing GORF runners are registered to other repositories and cannot serve this repository simultaneously. Register a separate runner rather than reconfiguring one of them:
-
-```bash
-mkdir -p ~/actions-runner-garmin-sync && cd ~/actions-runner-garmin-sync
-# Download the matching runner release, then obtain a one-time registration token
-# from github.com/dave0875/garminSync/settings/actions/runners/new.
-./config.sh --url https://github.com/dave0875/garminSync --token TOKEN \
-  --name garmin-sync-gorf --labels gorf,garmin-sync --unattended
-install -Dm644 /path/to/garminSync/systemd/actions-runner-garmin-sync.service \
-  ~/.config/systemd/user/actions-runner-garmin-sync.service
-systemctl --user daemon-reload
-systemctl --user enable --now actions-runner-garmin-sync.service
-```
-
-## First enrollment and replacement
-
-After the hardening release is installed, the service intentionally remains in `unenrolled` state until the attached Fenix is explicitly pinned:
-
-```bash
-garmin-syncctl enroll
-garmin-syncctl status
-```
-
-Enrollment requires exactly one qualifying Fenix 8. Replacing the enrolled watch is an explicit maintenance action:
-
-```bash
-systemctl --user stop garmin-sync.service
-garmin-syncctl enroll --replace
-systemctl --user start garmin-sync.service
-```
-
-## Archive policy
-
-`gdrive:Garmin/Fenix8_Archive` is preservation storage for overwritten destination objects. The default policy is **preserve indefinitely; no automatic deletion**. `garmin-syncctl doctor` reports the number of top-level archive run directories so growth is visible and can be reviewed manually before any future retention policy is introduced.
-
-## Backup health versus process readiness
-
-`garmin-syncctl status` now includes a `sync_health` object in addition to the
-existing service `healthy` field. A running service and a previous successful
-run are **not** evidence that a newly connected watch or activity is backed up.
-
-- `waiting_for_device`: no mounted enrolled watch; last success is historical.
-- `connected_unverified`: the watch is visible, but this mount session has no verified copy yet.
-- `syncing`: a copy/verification is active; the backup is not yet proven.
-- `synced`: the currently mounted watch completed a verified copy in this daemon session.
-- `degraded`: device unenrolled, run failed/blocked/retrying, or daemon not ready.
-
-`readiness` remains the process/build deployment gate and does not require a
-plugged-in device. The `healthy` field preserves backward-compatible service
-semantics; use `sync_health.state` when deciding whether an activity is backed up.
-
-## Linux USB/MTP troubleshooting
-
-On GORF, the daemon now reconciles **read-only** Linux sysfs descriptors at
-`/sys/bus/usb/devices` alongside the existing Gio/MTP mount events and 60-second
-mount scan. `usb_state_changed` appears only on state transitions. The structured
-`status` state includes `usb_state`, `mtp_mounted`, and `mtp_mount_delayed`:
-
-- `absent`: no visible Garmin USB device; check data cable, connector, and port.
-- `garmin_transient`: the `091e:0003` interface is visible, but not the expected MTP interface.
-- `fenix_mtp_interface`: Linux can see `091e:51b5`; MTP mount can still lag.
-- `unavailable`: sysfs probe unavailable, not evidence of disconnection.
-
-A stable Fenix USB interface without its mounted Garmin source for at least
-120 seconds emits one `mtp_mount_delayed` event until the state changes.
-Kernel-level enumeration failures that never produce a sysfs entry **cannot**
-be diagnosed by this observer. For physical enumeration failures use
-`sudo journalctl -k -f`, `lsusb -d 091e:`, and check your cable/port.
-The daemon never resets USB devices, reads privileged kernel logs, or
-changes the existing enrolled-device verification.
-
-## Proven activity backup reporting
-
-After a successful `rclone check --one-way` and a final source inventory and
-watch identity check, the sync records one `activity_verified` journal event
-for the newest selected native Activity FIT. `garmin-syncctl status` exposes
-`last_verified_activity` (also retained in `state.last_verified_activity`),
-including the relative filename, the exact Google Drive destination path,
-run ID, timestamp, verification method, source mode, and selection basis.
-
-An Activity filename such as `Activity/2026-10-11-08-17-40.fit` uses the embedded
-timestamp. Unusual/legacy names use file modified time or deterministic name
-ordering as a **best-effort latest candidate**, with explicit
-`selection_basis` provenance. The reported file *is* verified when the
-verification event appears, but a fallback is not proof it is chronologically
-the most recently recorded activity.
-
-A `preview_completed`, `copy_completed`, or `inventory` log alone is never
-proof that a workout reached Drive. Dry-runs cannot promote an activity;
-verify-only reports `verified_activity` for that run but does not overwrite
-the previously established successful-copy `last_verified_activity`.
-Failed or interrupted runs also preserve the historical good record. If no
-Activity FIT is selected, the new run reports none and retains its previous
-historical record without claiming it is current.
-
-For the Oct 11 half marathon, look for the precise FIT in the successful
-`activity_verified` journal event (and match its `run_id` to `verified`),
-then inspect `garmin-syncctl status`. The actual Drive backup remains
-unconfirmed until such evidence exists.
-
-## Operator commands
-
-The commands below are Linux/GORF service operations unless noted. On macOS use
-`once`, `dry-run`, `force`, and `verify` as described above.
-
+Useful operator commands:
 
 ```bash
 garmin-syncctl status
 garmin-syncctl doctor
-journalctl --user -u garmin-sync.service -n 50 --no-pager
 garmin-syncctl force
 garmin-syncctl dry-run
-garmin_fit_inspect.py /path/to/native.fit
-
-# A full direct verification owns the same process lock as the daemon.
-systemctl --user stop garmin-sync.service
-garmin-syncctl verify
-systemctl --user start garmin-sync.service
+journalctl --user -u garmin-sync.service -n 50 --no-pager
 ```
 
-`status` reports the live systemd PID, daemon PID, enrolled-device state, and deployed build metadata; it exits non-zero when the application is not healthy. `readiness` is an internal deployment probe that verifies process/build initialization even when a newly installed service is intentionally waiting for its first enrollment.
+For macOS:
+
+```bash
+bash scripts/install-macos-launchagent.sh install
+bash scripts/install-macos-launchagent.sh status
+tail -f ~/Library/Logs/garmin-sync/watch.log
+```
+
+## GORF deployment and migration
+
+**The production GORF installation is a legacy Fenix 8 configuration, not a
+requirement for other users.** Its original Drive locations are
+`Garmin/Fenix8_Backup` and `Garmin/Fenix8_Archive`; they must be preserved.
+
+The guarded GORF deploy script runs only as `dbarker@GORF` and accepts the
+current main SHA after CI. It installs atomically, verifies application
+readiness, and rolls back on failure. The repository's deploy workflow is
+restricted to the original repository's main branch and a specifically
+labeled GORF runner. Clones/forks do not deploy to GORF.
+
+The new code explicitly **refuses promotion without a bound private installation
+profile**; before merging a release, bind two dedicated remotes rooted at the
+**existing** backup/archive folder IDs, verify the account and perform a
+read-only qualification. See the migration warning in the installation guide.
+Do not rename, relocate, or replace those folders during migration.
+An optional runner/privilege isolation hardening remains tracked in #35.
+
+## Verification and operational truth
+
+`status` distinguishes process readiness from device backup health. The
+`activity_verified` journal event identifies the most recent verified native
+Activity FIT by path, run ID and timestamp. Merely discovering or previewing
+a FIT does not prove it was uploaded.
+
+The local regression suite checks upload idempotence, archive-on-overwrite,
+checksum failures, disconnected/watch-identity races, FIT selection, Mac MTP
+parsing, and account/folder binding. CI has no access to real Garmin hardware
+or personal OAuth credentials.
+
+## Known limitations
+
+This version supports OAuth Google Drive remotes with existing folder ID roots.
+Service accounts, shared drives, and unsupported Garmin MTP transports require
+separate verification before they can be enabled safely. A person who steals
+the private OAuth tokens and the installation binding can impersonate the
+installation; maintain OS file permissions and separate CI from production
+credentials.
