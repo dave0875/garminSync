@@ -24,9 +24,11 @@ import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
+import garmin_backup_target as backup_target
+
 VERSION = "1.5.0"
-DESTINATION = "gdrive:Garmin/Fenix8_Backup"
-ARCHIVE_BASE = "gdrive:Garmin/Fenix8_Archive"
+DESTINATION = None  # No cloud destination exists until explicitly account/folder-bound.
+ARCHIVE_BASE = None
 IS_DARWIN = sys.platform == "darwin"
 SOURCE_ROOT = Path(__file__).resolve().parent
 INSTALLED_ROOT = Path.home() / ".local/bin/garmin-sync"
@@ -622,8 +624,10 @@ class Runner:
         if self.cancellation.is_set():
             raise Cancelled("Connection interrupted")
         with open(stderr_path, "ab") as stderr:
+            clean_env = (backup_target.clean_rclone_environment()
+                         if Path(args[0]).name == Path(RCLONE).name else None)
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=stderr,
-                                    start_new_session=True)
+                                    start_new_session=True, env=clean_env)
             with self.lock:
                 self.process = proc
             start = time.monotonic()
@@ -760,12 +764,34 @@ class SyncRun:
         self.inspect = inspect
         self.inspector = Path(inspector)
         self.sdk_python = Path(sdk_python)
+        self.rclone_options = []
 
     def update(self, **fields):
         if self.state:
             self.state.update(token=self.token, **fields)
 
     def execute(self, source, mode="copy", source_snapshot=False):
+        if (self.destination is None) != (self.archive_base is None):
+            raise backup_target.BindingError("Backup and archive must both be configured")
+        if self.destination is None:
+            # Fail closed before any remote write, including backup-dir creation.
+            # Local-path test fixtures can still pass explicit destinations.
+            with backup_target.prepared_target(RCLONE, self.runtime) as binding:
+                self.destination = binding["destination"]
+                self.archive_base = binding["archive_base"]
+                self.rclone_options = binding["rclone_options"]
+                self.update(destination=self.destination, archive_base=self.archive_base,
+                            installation_id=binding["installation_id"],
+                            binding_verified_at=now())
+                try:
+                    return self._execute(source, mode, source_snapshot)
+                finally:
+                    self.destination = None
+                    self.archive_base = None
+                    self.rclone_options = []
+        return self._execute(source, mode, source_snapshot)
+
+    def _execute(self, source, mode="copy", source_snapshot=False):
         private_dir(self.runtime)
         run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex
         with tempfile.TemporaryDirectory(prefix="run-", dir=self.runtime) as dirname:
@@ -784,7 +810,7 @@ class SyncRun:
             original_device = model_at(Path(source))
             if not original_device:
                 raise Cancelled("Device identity missing at start")
-            common = FINITE + ["--use-json-log", "--log-level", "INFO", "--log-file", str(logfile)]
+            common = FINITE + ["--use-json-log", "--log-level", "INFO", "--log-file", str(logfile)] + self.rclone_options
 
             def inventory():
                 result = self.runner.run([RCLONE, "lsjson", source, "-R", "--files-only",
@@ -1210,27 +1236,27 @@ def doctor():
     checks["rclone_binary"] = Path(RCLONE).is_file()
     checks["gdrive_configured"] = False
     checks["gdrive_available"] = False
+    checks["destination_identity_verified"] = False
     checks["archive_policy"] = "preserve_indefinitely_manual_review"
     checks["archive_run_directories"] = None
     if checks["rclone_binary"]:
-        remotes = subprocess.run([RCLONE, "listremotes"], capture_output=True, text=True)
-        checks["gdrive_configured"] = remotes.returncode == 0 and "gdrive:" in remotes.stdout.splitlines()
-        if checks["gdrive_configured"]:
-            remote_args = ["--timeout", "15s", "--contimeout", "5s", "--retries", "1",
-                           "--low-level-retries", "1"]
-            try:
-                probe = subprocess.run(
-                    [RCLONE, "lsf", "gdrive:Garmin", "--max-depth", "1", "--dirs-only",
-                     *remote_args], capture_output=True, text=True, timeout=30)
-                checks["gdrive_available"] = probe.returncode == 0
+        try:
+            with backup_target.prepared_target(RCLONE, RUNTIME) as binding:
+                checks["gdrive_configured"] = True
+                checks["gdrive_available"] = True
+                checks["destination_identity_verified"] = True
+                remote_args = ["--timeout", "15s", "--contimeout", "5s",
+                               "--retries", "1", "--low-level-retries", "1"]
                 archive = subprocess.run(
-                    [RCLONE, "lsf", ARCHIVE_BASE, "--max-depth", "1", "--dirs-only",
-                     *remote_args], capture_output=True, text=True, timeout=30)
+                    [RCLONE, "lsf", binding["archive_base"], "--max-depth", "1",
+                     "--dirs-only", *binding["rclone_options"], *remote_args],
+                    capture_output=True, text=True, timeout=30,
+                    env=backup_target.clean_rclone_environment())
                 if archive.returncode == 0:
                     checks["archive_run_directories"] = len(
                         [line for line in archive.stdout.splitlines() if line.strip()])
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                checks["gdrive_error"] = str(exc)
+        except (backup_target.BindingError, OSError, subprocess.TimeoutExpired) as exc:
+            checks["gdrive_error"] = str(exc)
 
     if IS_DARWIN:
         checks["mtp_tools"] = all(
@@ -1437,7 +1463,33 @@ def main(argv=None):
         commands.add_parser(name)
     enrollment = commands.add_parser("enroll")
     enrollment.add_argument("--replace", action="store_true")
+    for name in ("inspect-target", "bind-target"):
+        binding = commands.add_parser(name)
+        binding.add_argument("--rclone-config", required=True)
+        binding.add_argument("--backup-remote", required=True)
+        binding.add_argument("--archive-remote", required=True)
+        if name == "bind-target":
+            binding.add_argument("--google-account-id", required=True)
+            binding.add_argument("--backup-folder-id", required=True)
+            binding.add_argument("--archive-folder-id", required=True)
     args = parser.parse_args(argv)
+    if args.command in ("inspect-target", "bind-target"):
+        try:
+            if args.command == "inspect-target":
+                inspected = backup_target.inspect_remotes(
+                    RCLONE, backup_target.private_file(
+                        Path(args.rclone_config).expanduser().absolute()),
+                    args.backup_remote, args.archive_remote)
+                print(json.dumps(inspected, indent=2))
+            else:
+                result = backup_target.bind_profile(
+                    RCLONE, args.rclone_config, args.backup_remote, args.archive_remote,
+                    args.google_account_id, args.backup_folder_id, args.archive_folder_id)
+                print(json.dumps(result, indent=2))
+            return 0
+        except (backup_target.BindingError, OSError, subprocess.TimeoutExpired) as exc:
+            log("binding_refused", error=str(exc))
+            return 1
     if args.command == "status":
         if IS_DARWIN:
             payload = {
