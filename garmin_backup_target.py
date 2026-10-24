@@ -230,7 +230,7 @@ def bind_profile(rclone_binary, rclone_config, backup_remote, archive_remote,
     candidate = {
         "schema_version": 1,
         "installation_id": str(uuid.uuid4()),
-        "rclone_config": str(private_file(Path(rclone_config).expanduser().resolve())),
+        "rclone_config": str(private_file(Path(rclone_config).expanduser().absolute())),
         "backup_remote": backup_remote,
         "archive_remote": archive_remote,
         "google_permission_id": approved_permission_id,
