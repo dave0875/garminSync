@@ -151,6 +151,18 @@ printf '%s\n' \
   "previous_fit_sdk=${installed_sdk:-missing}" \
   "target_fit_sdk=$expected_sdk" > "$backup/manifest.txt"
 
+# Never upgrade a working GORF service to an unbound destination.
+# The operator must pre-enroll the *existing* Drive folder IDs beforehand.
+if [[ ! -f "$HOME/.config/garmin-sync/installation.json" ]]; then
+  echo "Refusing deployment: migrate and bind the existing GORF Google Drive folders first." >&2
+  exit 77
+fi
+PYTHONPATH="$repo_root" /usr/bin/python3 - <<'PY'
+import garmin_backup_target as target
+with target.prepared_target("rclone", target.PROFILE_PATH.parent):
+    pass
+PY
+
 rollback_armed=0
 restore_one() {
   local backup_name="$1" destination="$2"
@@ -193,18 +205,6 @@ rollback() {
 trap 'code=$?; rollback "$code"; exit "$code"' ERR
 trap 'rollback 130; exit 130' INT TERM
 rollback_armed=1
-
-# Never upgrade a working GORF service to an unbound destination.
-# The operator must pre-enroll the *existing* Drive folder IDs beforehand.
-if [[ ! -f "$HOME/.config/garmin-sync/installation.json" ]]; then
-  echo "Refusing deployment: migrate and bind the existing GORF Google Drive folders first." >&2
-  exit 77
-fi
-PYTHONPATH="$repo_root" /usr/bin/python3 - <<'PY'
-import garmin_backup_target as target
-with target.prepared_target("rclone", target.PROFILE_PATH.parent):
-    pass
-PY
 
 # Stop only when a runtime/dependency migration is actually necessary. This
 # prevents README/runner-only pushes from interrupting an active watch copy.
