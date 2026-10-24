@@ -20,6 +20,12 @@ if [[ "$(id -un)" != "dbarker" || "$(hostname -s | tr '[:lower:]' '[:upper:]')" 
 fi
 
 if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  if [[ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" ||
+        "${GARMIN_DEPLOY_CONFIRM:-}" != "DEPLOY_GORF" ||
+        "${GITHUB_ACTOR:-}" != "dave0875" ]]; then
+    echo "Refusing automated deployment: require explicit owner main-branch dispatch." >&2
+    exit 64
+  fi
   [[ "${GITHUB_REF:-}" == "refs/heads/main" ]] || {
     echo "Refusing deployment: GitHub Actions deployments must target main." >&2
     exit 64
