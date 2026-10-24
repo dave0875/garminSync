@@ -473,7 +473,7 @@ OK.
             self.assertEqual(sync.linux_usb_presence(root), "garmin_transient")
             (device / "idProduct").write_text("51b5\n")
             self.assertEqual(sync.linux_usb_presence(root), "fenix_mtp_interface")
-            (device / "idProduct").write_text("1234\\n")
+            (device / "idProduct").write_text("1234\n")
             self.assertEqual(sync.linux_usb_presence(root), "garmin_mtp_interface")
             (device / "idProduct").unlink()
             self.assertEqual(sync.linux_usb_presence(root), "absent")
