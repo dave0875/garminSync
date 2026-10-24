@@ -55,7 +55,9 @@ jobs:
     if: >-
       github.repository == 'dave0875/garminSync' &&
       github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || inputs.confirm == 'DEPLOY_GORF')
+      github.event_name == 'workflow_dispatch' &&
+      github.actor == 'dave0875' &&
+      inputs.confirm == 'DEPLOY_GORF'
     runs-on: [self-hosted, Linux, X64, gorf, garmin-sync]
     timeout-minutes: 15
     concurrency:
@@ -68,4 +70,5 @@ jobs:
       - name: Deploy tested native-only implementation
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GARMIN_DEPLOY_CONFIRM: ${{ inputs.confirm }}
         run: scripts/deploy-gorf.sh
