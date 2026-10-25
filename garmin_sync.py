@@ -26,6 +26,9 @@ import xml.etree.ElementTree as ET
 import garmin_backup_target as backup_target
 import garmin_platform
 
+if os.name != "nt":
+    import fcntl  # Retained for POSIX compatibility and lock regression fixtures.
+
 VERSION = "1.5.0"
 DESTINATION = None  # No cloud destination exists until explicitly account/folder-bound.
 ARCHIVE_BASE = None
