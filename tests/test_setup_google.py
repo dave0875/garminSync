@@ -41,6 +41,15 @@ class SetupTests(unittest.TestCase):
             profile_path=self.profile, confirm=lambda _: confirm,
             authorize=lambda _: TOKEN)
 
+    def test_windows_incomplete_credential_adapter_fails_before_oauth_and_writes(self):
+        with mock.patch.object(setup.sys, "platform", "win32"), \
+             mock.patch.object(setup, "publisher_metadata") as publisher, \
+             mock.patch.object(setup.drive, "create_default_layout") as folders:
+            with self.assertRaisesRegex(setup.SetupError, "Windows secure credential"):
+                self.invoke("CREATE")
+            publisher.assert_not_called()
+            folders.assert_not_called()
+
     def test_missing_publisher_metadata_rejected_before_google_access(self):
         self.metadata.unlink()
         with mock.patch.object(setup.drive, "create_default_layout") as create:
