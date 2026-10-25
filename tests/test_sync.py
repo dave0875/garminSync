@@ -254,7 +254,7 @@ OK.
             arg_budget=96 * 1024)
         self.assertEqual([len(batch) for batch in constrained], [3, 3, 3, 1])
 
-    def test_macos_ioreg_detects_fenix_usb_device(self):
+    def test_macos_ioreg_detects_other_garmin_models(self):
         import plistlib
         fixture = [{
             "IORegistryEntryChildren": [
@@ -263,12 +263,14 @@ OK.
                  "USB Product Name": "fenix 8 - 51mm"},
             ]
         }]
-        self.assertTrue(sync.fenix_present_in_ioreg(plistlib.dumps(fixture)))
+        self.assertTrue(sync.garmin_present_in_ioreg(plistlib.dumps(fixture)))
         fixture[0]["IORegistryEntryChildren"][1]["idProduct"] = 0x9999
         fixture[0]["IORegistryEntryChildren"][1]["USB Product Name"] = "fenix 8 - 51mm"
-        self.assertTrue(sync.fenix_present_in_ioreg(plistlib.dumps(fixture)))
+        self.assertTrue(sync.garmin_present_in_ioreg(plistlib.dumps(fixture)))
         fixture[0]["IORegistryEntryChildren"][1]["USB Product Name"] = "Other Garmin"
-        self.assertFalse(sync.fenix_present_in_ioreg(plistlib.dumps(fixture)))
+        self.assertTrue(sync.garmin_present_in_ioreg(plistlib.dumps(fixture)))
+        fixture[0]["IORegistryEntryChildren"][1]["idProduct"] = 0x0003
+        self.assertFalse(sync.garmin_present_in_ioreg(plistlib.dumps(fixture)))
 
     def test_macos_watch_syncs_once_per_connection_edge(self):
         sequence = iter([False, True, True, False, True, False])
@@ -320,16 +322,18 @@ OK.
                 with self.assertRaises(sync.Busy):
                     with sync.RunLocks(runtime, legacy): pass
             with sync.RunLocks(runtime, legacy): pass
-    def test_model_case_spacing_hash_and_wrong_model(self):
+    def test_model_case_spacing_hash_and_arbitrary_garmin_model(self):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name)
             xml = root / "GarminDevice.xml"
             xml.write_text(XML)
             self.assertNotEqual(sync.model_at(root)["identity"], "fixture")
             xml.write_text(XML.replace("FENIX  8", "fenix 80"))
-            self.assertIsNone(sync.model_at(root))
+            self.assertIsNotNone(sync.model_at(root))
             xml.write_text(XML.replace("FENIX  8", "fēnix8"))
             self.assertIsNotNone(sync.model_at(root))
+            xml.write_text(XML.replace("FENIX  8 - 51mm, Solar", "Forerunner 965"))
+            self.assertEqual(sync.model_at(root)["model"], "Forerunner 965")
             xml.write_text("<bad")
             self.assertIsNone(sync.model_at(root))
             xml.write_text(XML.replace("<Id>fixture</Id>", ""))
@@ -469,6 +473,8 @@ OK.
             self.assertEqual(sync.linux_usb_presence(root), "garmin_transient")
             (device / "idProduct").write_text("51b5\n")
             self.assertEqual(sync.linux_usb_presence(root), "fenix_mtp_interface")
+            (device / "idProduct").write_text("1234\n")
+            self.assertEqual(sync.linux_usb_presence(root), "garmin_mtp_interface")
             (device / "idProduct").unlink()
             self.assertEqual(sync.linux_usb_presence(root), "absent")
             self.assertEqual(sync.linux_usb_presence(root / "missing"), "unavailable")

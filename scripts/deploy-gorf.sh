@@ -20,6 +20,12 @@ if [[ "$(id -un)" != "dbarker" || "$(hostname -s | tr '[:lower:]' '[:upper:]')" 
 fi
 
 if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  if [[ "${GITHUB_EVENT_NAME:-}" != "workflow_dispatch" ||
+        "${GARMIN_DEPLOY_CONFIRM:-}" != "DEPLOY_GORF" ||
+        "${GITHUB_ACTOR:-}" != "dave0875" ]]; then
+    echo "Refusing automated deployment: require explicit owner main-branch dispatch." >&2
+    exit 64
+  fi
   [[ "${GITHUB_REF:-}" == "refs/heads/main" ]] || {
     echo "Refusing deployment: GitHub Actions deployments must target main." >&2
     exit 64
@@ -60,14 +66,14 @@ PY
   }
 fi
 
-for required in "$repo_root/garmin_sync.py" "$repo_root/garmin_fit_inspect.py" \
+for required in "$repo_root/garmin_sync.py" "$repo_root/garmin_backup_target.py" "$repo_root/garmin_fit_inspect.py" \
   "$repo_root/bin/garmin-syncctl" "$repo_root/bin/garmin_autodev_sync.sh" \
   "$repo_root/systemd/garmin-sync.service" "$repo_root/requirements.txt" \
   "$target_root/venv/bin/python3" "$target_root/venv/bin/pip"; do
   [[ -f "$required" ]] || { echo "Missing required file: $required" >&2; exit 66; }
 done
 
-/usr/bin/python3 -m py_compile "$repo_root/garmin_sync.py" "$repo_root/garmin_fit_inspect.py"
+/usr/bin/python3 -m py_compile "$repo_root/garmin_sync.py" "$repo_root/garmin_backup_target.py" "$repo_root/garmin_fit_inspect.py"
 PYTHONPATH="$repo_root" "$target_root/venv/bin/python3" -m unittest discover -s "$repo_root/tests" -v
 
 expected_sdk="$(sed -n 's/^garmin-fit-sdk==//p' "$repo_root/requirements.txt")"
@@ -90,6 +96,7 @@ different() {
 runtime_changed=0
 for pair in \
   "$repo_root/garmin_sync.py|$target_root/garmin_sync.py" \
+  "$repo_root/garmin_backup_target.py|$target_root/garmin_backup_target.py" \
   "$candidate_inspector|$target_bin/garmin_fit_inspect.py" \
   "$repo_root/bin/garmin-syncctl|$target_bin/garmin-syncctl" \
   "$repo_root/bin/garmin_autodev_sync.sh|$target_bin/garmin_autodev_sync.sh" \
@@ -135,7 +142,7 @@ backup_if_present() {
   fi
 }
 
-for installed in "$target_root/garmin_sync.py" "$target_bin/garmin_fit_inspect.py" \
+for installed in "$target_root/garmin_sync.py" "$target_root/garmin_backup_target.py" "$target_bin/garmin_fit_inspect.py" \
   "$target_bin/garmin-syncctl" "$target_bin/garmin_autodev_sync.sh" "$target_unit" \
   "$target_root/build.json"; do
   backup_if_present "$installed"
@@ -149,6 +156,18 @@ printf '%s\n' \
   "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   "previous_fit_sdk=${installed_sdk:-missing}" \
   "target_fit_sdk=$expected_sdk" > "$backup/manifest.txt"
+
+# Never upgrade a working GORF service to an unbound destination.
+# The operator must pre-enroll the *existing* Drive folder IDs beforehand.
+if [[ ! -f "$HOME/.config/garmin-sync/installation.json" ]]; then
+  echo "Refusing deployment: migrate and bind the existing GORF Google Drive folders first." >&2
+  exit 77
+fi
+PYTHONPATH="$repo_root" /usr/bin/python3 - <<'PY'
+import garmin_backup_target as target
+with target.prepared_target("rclone", target.PROFILE_PATH.parent):
+    pass
+PY
 
 rollback_armed=0
 restore_one() {
@@ -168,6 +187,7 @@ rollback() {
     set +e
     echo "Deployment failed; restoring the previously installed Garmin runtime." >&2
     restore_one "garmin_sync.py" "$target_root/garmin_sync.py"
+    restore_one "garmin_backup_target.py" "$target_root/garmin_backup_target.py"
     restore_one "garmin_fit_inspect.py" "$target_bin/garmin_fit_inspect.py"
     restore_one "garmin-syncctl" "$target_bin/garmin-syncctl"
     restore_one "garmin_autodev_sync.sh" "$target_bin/garmin_autodev_sync.sh"
@@ -208,6 +228,7 @@ install_atomic() {
 }
 
 install_atomic "$repo_root/garmin_sync.py" "$target_root/garmin_sync.py" 0755
+install_atomic "$repo_root/garmin_backup_target.py" "$target_root/garmin_backup_target.py" 0644
 install_atomic "$candidate_inspector" "$target_bin/garmin_fit_inspect.py" 0755
 install_atomic "$repo_root/bin/garmin-syncctl" "$target_bin/garmin-syncctl" 0755
 install_atomic "$repo_root/bin/garmin_autodev_sync.sh" "$target_bin/garmin_autodev_sync.sh" 0755

@@ -1,5 +1,5 @@
 [Unit]
-Description=Native fenix 8 device backup
+Description=Enrolled Garmin device private backup
 
 [Service]
 Type=simple

@@ -1,10 +1,9 @@
 #!/usr/bin/python3
-"""Copy and verify native files from a physically mounted fenix 8."""
+"""Preserve native files from an explicitly enrolled Garmin USB/MTP device."""
 
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import getpass
 import hashlib
 import json
@@ -24,10 +23,18 @@ import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
+import garmin_backup_target as backup_target
+import garmin_platform
+
+if os.name != "nt":
+    import fcntl  # Retained for POSIX compatibility and lock regression fixtures.
+
 VERSION = "1.5.0"
-DESTINATION = "gdrive:Garmin/Fenix8_Backup"
-ARCHIVE_BASE = "gdrive:Garmin/Fenix8_Archive"
+DESTINATION = None  # No cloud destination exists until explicitly account/folder-bound.
+ARCHIVE_BASE = None
 IS_DARWIN = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
+HOST_PATHS = garmin_platform.user_paths()
 SOURCE_ROOT = Path(__file__).resolve().parent
 INSTALLED_ROOT = Path.home() / ".local/bin/garmin-sync"
 
@@ -56,18 +63,16 @@ MTP_CONNECT = resolve_executable(
     "/opt/homebrew/bin/mtp-connect")
 IOREG = "/usr/sbin/ioreg"
 GARMIN_USB_VENDOR_ID = 0x091E
-FENIX8_USB_PRODUCT_ID = 0x51B5
 MACOS_LAUNCHD_LABEL = "com.dave0875.garmin-sync"
-RUNTIME = (Path.home() / "Library/Caches/garmin-sync" if IS_DARWIN
-           else Path(f"/run/user/{os.getuid()}/garmin-sync"))
-STATE_PATH = Path.home() / ".local/state/garmin-sync/state.json"
+RUNTIME = HOST_PATHS["runtime"]
+STATE_PATH = HOST_PATHS["state"]
 INSPECTOR = (INSTALLED_ROOT.parent / "garmin_fit_inspect.py"
              if (INSTALLED_ROOT.parent / "garmin_fit_inspect.py").is_file()
              else SOURCE_ROOT / "garmin_fit_inspect.py")
 SDK_PYTHON = (INSTALLED_ROOT / "venv/bin/python3"
               if (INSTALLED_ROOT / "venv/bin/python3").is_file()
               else Path(sys.executable))
-DEVICE_PIN_PATH = Path.home() / ".config/garmin-sync/device.json"
+DEVICE_PIN_PATH = HOST_PATHS["device"]
 BUILD_PATH = INSTALLED_ROOT / "build.json"
 EXCLUDED_EXTENSIONS = (
     "img|gma|unl|gcd|rgn|mp3|m4a|wav|aac|flac|ogg|wma|mp4|m4v|"
@@ -110,6 +115,7 @@ def linux_usb_presence(sysfs_root=Path("/sys/bus/usb/devices")):
     except OSError:
         return "unavailable"
     transient = False
+    garmin_mtp = False
     for device in devices:
         try:
             vendor = (device / "idVendor").read_text().strip().lower()
@@ -119,10 +125,13 @@ def linux_usb_presence(sysfs_root=Path("/sys/bus/usb/devices")):
         except OSError:
             continue
         if product == "51b5":
-            return "fenix_mtp_interface"
+            return "fenix_mtp_interface"  # Retain legacy telemetry for GORF dashboards.
         if product == "0003":
             transient = True
-    return "garmin_transient" if transient else "absent"
+        else:
+            garmin_mtp = True
+    return ("garmin_mtp_interface" if garmin_mtp else
+            "garmin_transient" if transient else "absent")
 
 
 class UsbHealthObserver:
@@ -143,7 +152,7 @@ class UsbHealthObserver:
             self.changed_at = moment
             self.warned = False
             log("usb_state_changed", usb_state=usb_state, mtp_mounted=bool(mtp_mounted))
-        if (usb_state == "fenix_mtp_interface" and not mtp_mounted and
+        if (usb_state in ("fenix_mtp_interface", "garmin_mtp_interface") and not mtp_mounted and
                 not self.warned and moment - self.changed_at >= self.grace_seconds):
             self.warned = True
             log("mtp_mount_delayed", usb_state=usb_state,
@@ -168,15 +177,15 @@ def assess_sync_health(state, enrolled=None, service_ready=None):
             "retry_at": state.get("retry_at"),
             "verified_current_connection": bool(verified_current)}
     if enrolled is False or status == "unenrolled":
-        level, reason = "degraded", "no enrolled Fenix 8; enrollment required"
+        level, reason = "degraded", "no enrolled Garmin device; enrollment required"
     elif service_ready is False:
         level, reason = "degraded", "daemon not ready (service or process mismatch)"
     elif status in ("failed", "blocked", "retry_wait", "stopped", "stopping"):
         level, reason = "degraded", state.get("last_error") or "synchronization failed or is blocked"
     elif not detected and state.get("mtp_mount_delayed"):
-        level, reason = "degraded", "Fenix USB present but MTP mount unavailable beyond grace period"
+        level, reason = "degraded", "Garmin USB present but MTP mount unavailable beyond grace period"
     elif not detected:
-        level, reason = "waiting_for_device", "no mounted enrolled Fenix 8; previous success is historical"
+        level, reason = "waiting_for_device", "no mounted enrolled Garmin device; previous success is historical"
     elif status in ("copy", "verifying", "dry-run"):
         level, reason = "syncing", "current device is being processed; verification pending"
     elif verified_current:
@@ -290,11 +299,11 @@ class RunLocks:
         private_dir(self.paths[0].parent)
         try:
             for path in self.paths:
-                fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+                fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
                 handle = os.fdopen(fd, "r+")
                 self.handles.append(handle)
                 try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    garmin_platform.try_lock(handle)
                 except BlockingIOError as exc:
                     raise Busy("Another Garmin copy process holds " + str(path)) from exc
             return self
@@ -314,7 +323,7 @@ def model_at(root):
         description = next((node.text or "" for node in tree.iter()
                             if node.tag.rsplit("}", 1)[-1] == "Description"), "")
         model = unicodedata.normalize("NFKD", description).encode("ascii", "ignore").decode()
-        if not re.match(r"fenix\s*8(?:\D|$)", model, re.IGNORECASE):
+        if not model.strip():
             return None
         identity = next((node.text or "" for node in tree.iter()
                          if node.tag.rsplit("}", 1)[-1] == "Id"), "").strip()
@@ -349,11 +358,17 @@ def native_mount_paths(mounts):
 
 
 def discover(mount_paths=(), uid=None, username=None, expected_identity=None):
-    uid = os.getuid() if uid is None else uid
+    uid = (os.getuid() if hasattr(os, "getuid") else 0) if uid is None else uid
     username = getpass.getuser() if username is None else username
     bases = list(dict.fromkeys(Path(path) for path in mount_paths))
-    for parent in (Path(f"/run/user/{uid}/gvfs"), Path("/media") / username,
-                   Path("/run/media") / username):
+    if IS_WINDOWS:
+        # Windows file-system volumes are supported for read-only discovery.
+        # USB MTP/WPD-only watches require a separate native Windows adapter.
+        bases.extend(Path(value) for value in garmin_platform.windows_garmin_mounts(
+            garmin_platform.windows_volume_infos()) if Path(value) not in bases)
+    for parent in (() if IS_WINDOWS else
+                   (Path(f"/run/user/{uid}/gvfs"), Path("/media") / username,
+                    Path("/run/media") / username)):
         try:
             for path in sorted(parent.iterdir()):
                 if garmin_hint(path.name) and path not in bases:
@@ -361,18 +376,30 @@ def discover(mount_paths=(), uid=None, username=None, expected_identity=None):
         except OSError:
             pass
     found = []
+    seen_physical_roots = set()
     for base in bases:
         for root in candidate_roots(base):
             item = model_at(root)
             if item:
-                found.append(item)
+                # Windows/macOS may have case-insensitive volumes: GARMIN,
+                # Garmin and garmin can refer to the same actual directory.
+                # Count the real filesystem identity once, not the spellings.
+                try:
+                    st = root.stat()
+                    identity_key = ((st.st_dev, st.st_ino) if st.st_ino
+                                    else str(root).casefold())
+                except OSError:
+                    identity_key = str(root).casefold()
+                if identity_key not in seen_physical_roots:
+                    seen_physical_roots.add(identity_key)
+                    found.append(item)
     if len(found) > 1:
         log("multiple_devices", sources=[item["root"] for item in found])
-        raise DiscoveryError("Multiple fenix 8 devices detected; connect only the enrolled watch")
+        raise DiscoveryError("Multiple Garmin devices detected; connect only the enrolled device")
     if expected_identity:
         if found and found[0]["identity"] != expected_identity:
             log("untrusted_device", source=found[0]["root"])
-            raise DiscoveryError("Connected fenix 8 is not the enrolled device")
+            raise DiscoveryError("Connected Garmin device is not the enrolled device")
         return found[0] if found else None
     return found[0] if found else None
 
@@ -559,7 +586,7 @@ def download_mtp_entries(entries, garmin_root, runner, stderr, max_items=1024,
 
 @contextlib.contextmanager
 def stage_macos_device(expected_identity=None, metadata_only=False, runner=None):
-    """Materialize a verified read-only snapshot of a Fenix MTP filesystem."""
+    """Materialize a verified read-only snapshot of an enrolled Garmin MTP filesystem."""
     if not IS_DARWIN:
         raise DiscoveryError("The libmtp staging transport is only used on macOS")
     runner = runner or Runner()
@@ -583,9 +610,9 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
             seconds=round(time.monotonic() - download_started, 3))
         device = model_at(garmin_root)
         if not device:
-            raise DiscoveryError("Connected MTP device is not a Fenix 8 with a valid GarminDevice.xml")
+            raise DiscoveryError("Connected MTP device lacks a valid GarminDevice.xml")
         if expected_identity and device["identity"] != expected_identity:
-            raise DiscoveryError("Connected fenix 8 is not the enrolled device")
+            raise DiscoveryError("Connected Garmin device is not the enrolled device")
         if not metadata_only:
             reinventory_started = time.monotonic()
             after = mtp_inventory(runner, stderr)
@@ -597,7 +624,7 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
             final_device = model_at(garmin_root)
             if final_device != device:
                 raise Cancelled("Device identity changed during MTP staging")
-        device["display_source"] = "mtp:Garmin/fenix8"
+        device["display_source"] = "mtp:Garmin/" + device["model"]
         device["transport"] = "libmtp"
         yield device
 
@@ -613,14 +640,16 @@ class Runner:
         proc = self.process
         if proc and proc.poll() is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGTERM)
+                (proc.terminate() if IS_WINDOWS else os.killpg(proc.pid, signal.SIGTERM))
 
     def run(self, args, stderr_path, timeout=1230, accepted_returncodes=(0,)):
         if self.cancellation.is_set():
             raise Cancelled("Connection interrupted")
         with open(stderr_path, "ab") as stderr:
+            clean_env = (backup_target.clean_rclone_environment()
+                         if Path(args[0]).name == Path(RCLONE).name else None)
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=stderr,
-                                    start_new_session=True)
+                                    start_new_session=not IS_WINDOWS, env=clean_env)
             with self.lock:
                 self.process = proc
             start = time.monotonic()
@@ -630,11 +659,11 @@ class Runner:
                     if self.cancellation.is_set() or time.monotonic() - start > timeout:
                         if terminated is None:
                             with contextlib.suppress(ProcessLookupError):
-                                os.killpg(proc.pid, signal.SIGTERM)
+                                (proc.terminate() if IS_WINDOWS else os.killpg(proc.pid, signal.SIGTERM))
                             terminated = time.monotonic()
                         elif time.monotonic() - terminated > 3:
                             with contextlib.suppress(ProcessLookupError):
-                                os.killpg(proc.pid, signal.SIGKILL)
+                                (proc.kill() if IS_WINDOWS else os.killpg(proc.pid, signal.SIGKILL))
                     try:
                         stdout, _ = proc.communicate(timeout=0.2)
                         break
@@ -757,12 +786,34 @@ class SyncRun:
         self.inspect = inspect
         self.inspector = Path(inspector)
         self.sdk_python = Path(sdk_python)
+        self.rclone_options = []
 
     def update(self, **fields):
         if self.state:
             self.state.update(token=self.token, **fields)
 
     def execute(self, source, mode="copy", source_snapshot=False):
+        if (self.destination is None) != (self.archive_base is None):
+            raise backup_target.BindingError("Backup and archive must both be configured")
+        if self.destination is None:
+            # Fail closed before any remote write, including backup-dir creation.
+            # Local-path test fixtures can still pass explicit destinations.
+            with backup_target.prepared_target(RCLONE, self.runtime) as binding:
+                self.destination = binding["destination"]
+                self.archive_base = binding["archive_base"]
+                self.rclone_options = binding["rclone_options"]
+                self.update(destination=self.destination, archive_base=self.archive_base,
+                            installation_id=binding["installation_id"],
+                            binding_verified_at=now())
+                try:
+                    return self._execute(source, mode, source_snapshot)
+                finally:
+                    self.destination = None
+                    self.archive_base = None
+                    self.rclone_options = []
+        return self._execute(source, mode, source_snapshot)
+
+    def _execute(self, source, mode="copy", source_snapshot=False):
         private_dir(self.runtime)
         run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex
         with tempfile.TemporaryDirectory(prefix="run-", dir=self.runtime) as dirname:
@@ -781,7 +832,7 @@ class SyncRun:
             original_device = model_at(Path(source))
             if not original_device:
                 raise Cancelled("Device identity missing at start")
-            common = FINITE + ["--use-json-log", "--log-level", "INFO", "--log-file", str(logfile)]
+            common = FINITE + ["--use-json-log", "--log-level", "INFO", "--log-file", str(logfile)] + self.rclone_options
 
             def inventory():
                 result = self.runner.run([RCLONE, "lsjson", source, "-R", "--files-only",
@@ -1158,6 +1209,8 @@ def once(state, mode):
             signal.signal(sig, handler)
 
 def service_snapshot():
+    if IS_WINDOWS:
+        return {"ActiveState": "unsupported", "reason": "Windows scheduled task adapter is not installed"}
     service = subprocess.run(["/usr/bin/systemctl", "--user", "show", "garmin-sync.service",
                               "--property=ActiveState,SubState,MainPID,Result"],
                              capture_output=True, text=True)
@@ -1203,33 +1256,39 @@ def conflicting_autostarts(directory=None):
 
 def doctor():
     checks = {}
-    checks["platform"] = "darwin" if IS_DARWIN else "linux"
+    checks["platform"] = "windows" if IS_WINDOWS else ("darwin" if IS_DARWIN else "linux")
     checks["rclone_binary"] = Path(RCLONE).is_file()
     checks["gdrive_configured"] = False
     checks["gdrive_available"] = False
+    checks["destination_identity_verified"] = False
     checks["archive_policy"] = "preserve_indefinitely_manual_review"
     checks["archive_run_directories"] = None
     if checks["rclone_binary"]:
-        remotes = subprocess.run([RCLONE, "listremotes"], capture_output=True, text=True)
-        checks["gdrive_configured"] = remotes.returncode == 0 and "gdrive:" in remotes.stdout.splitlines()
-        if checks["gdrive_configured"]:
-            remote_args = ["--timeout", "15s", "--contimeout", "5s", "--retries", "1",
-                           "--low-level-retries", "1"]
-            try:
-                probe = subprocess.run(
-                    [RCLONE, "lsf", "gdrive:Garmin", "--max-depth", "1", "--dirs-only",
-                     *remote_args], capture_output=True, text=True, timeout=30)
-                checks["gdrive_available"] = probe.returncode == 0
+        try:
+            with backup_target.prepared_target(RCLONE, RUNTIME) as binding:
+                checks["gdrive_configured"] = True
+                checks["gdrive_available"] = True
+                checks["destination_identity_verified"] = True
+                remote_args = ["--timeout", "15s", "--contimeout", "5s",
+                               "--retries", "1", "--low-level-retries", "1"]
                 archive = subprocess.run(
-                    [RCLONE, "lsf", ARCHIVE_BASE, "--max-depth", "1", "--dirs-only",
-                     *remote_args], capture_output=True, text=True, timeout=30)
+                    [RCLONE, "lsf", binding["archive_base"], "--max-depth", "1",
+                     "--dirs-only", *binding["rclone_options"], *remote_args],
+                    capture_output=True, text=True, timeout=30,
+                    env=backup_target.clean_rclone_environment())
                 if archive.returncode == 0:
                     checks["archive_run_directories"] = len(
                         [line for line in archive.stdout.splitlines() if line.strip()])
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                checks["gdrive_error"] = str(exc)
+        except (backup_target.BindingError, OSError, subprocess.TimeoutExpired) as exc:
+            checks["gdrive_error"] = str(exc)
 
-    if IS_DARWIN:
+    if IS_WINDOWS:
+        checks["windows_wpd_mtp"] = False  # Required for full release qualification (#45).
+        checks["windows_transport"] = "drive-letter volumes only; WPD/MTP not yet implemented"
+        checks["gio"] = "not_required"
+        checks["build_metadata"] = "not_required"
+        checks["legacy_autostart_retired"] = True
+    elif IS_DARWIN:
         checks["mtp_tools"] = all(
             Path(tool).is_file() for tool in (MTP_FILETREE, MTP_FILES, MTP_CONNECT))
         checks["gio"] = "not_required"
@@ -1254,8 +1313,10 @@ def doctor():
     checks["enrolled_device"] = bool(enrolled_device())
 
     required = ["rclone_binary", "gdrive_configured", "gdrive_available",
-                "fit_sdk", "inspector", "enrolled_device"]
-    if IS_DARWIN:
+                "destination_identity_verified", "fit_sdk", "inspector", "enrolled_device"]
+    if IS_WINDOWS:
+        required.append("windows_wpd_mtp")
+    elif IS_DARWIN:
         required.append("mtp_tools")
     else:
         required.extend(["gio", "build_metadata", "legacy_autostart_retired"])
@@ -1320,8 +1381,8 @@ def _walk_plist(value):
             yield from _walk_plist(child)
 
 
-def fenix_present_in_ioreg(data):
-    """Return True when the enrolled Fenix USB model is visible in an IORegistry plist."""
+def garmin_present_in_ioreg(data):
+    """Return True when a Garmin USB product is visible; enrollment is checked at MTP."""
     try:
         tree = plistlib.loads(data)
     except (plistlib.InvalidFileException, ValueError, TypeError) as exc:
@@ -1329,14 +1390,8 @@ def fenix_present_in_ioreg(data):
     for node in _walk_plist(tree):
         vendor = _integer_property(node.get("idVendor"))
         product = _integer_property(node.get("idProduct"))
-        if vendor == GARMIN_USB_VENDOR_ID and product == FENIX8_USB_PRODUCT_ID:
+        if vendor == GARMIN_USB_VENDOR_ID and product is not None and product != 0x0003:
             return True
-        if vendor == GARMIN_USB_VENDOR_ID:
-            product_name = " ".join(
-                str(node.get(key, "")) for key in
-                ("USB Product Name", "kUSBProductString", "Product Name", "IORegistryEntryName"))
-            if re.search(r"fenix\s*8", product_name, re.IGNORECASE):
-                return True
     return False
 
 
@@ -1349,7 +1404,7 @@ def macos_launchagent_loaded():
     return result.returncode == 0
 
 
-def macos_fenix_usb_present():
+def macos_garmin_usb_present():
     if not IS_DARWIN:
         return False
     try:
@@ -1362,15 +1417,15 @@ def macos_fenix_usb_present():
         raise CommandFailed(
             "ioreg failed while querying USB devices: " +
             result.stderr.decode("utf-8", errors="replace").strip())
-    return fenix_present_in_ioreg(result.stdout)
+    return garmin_present_in_ioreg(result.stdout)
 
 
 def macos_watch(state, poll_seconds=5, retry_seconds=120, presence=None, stop_event=None):
-    """Sync once per Fenix USB connection; retry failures while still connected."""
+    """Sync once per Garmin USB connection; retry failures while connected."""
     if not IS_DARWIN:
         print("watch is only supported on macOS", file=sys.stderr)
         return 64
-    presence = presence or macos_fenix_usb_present
+    presence = presence or macos_garmin_usb_present
     stop_event = stop_event or threading.Event()
     old_handlers = {}
     if threading.current_thread() is threading.main_thread():
@@ -1394,8 +1449,7 @@ def macos_watch(state, poll_seconds=5, retry_seconds=120, presence=None, stop_ev
                 connected = True
                 synced = False
                 retry_at = 0.0
-                log("usb_connected", vendor_id=hex(GARMIN_USB_VENDOR_ID),
-                    product_id=hex(FENIX8_USB_PRODUCT_ID))
+                log("usb_connected", vendor_id=hex(GARMIN_USB_VENDOR_ID))
             elif not present and connected:
                 connected = False
                 synced = False
@@ -1428,6 +1482,20 @@ def macos_watch(state, poll_seconds=5, retry_seconds=120, presence=None, stop_ev
     return 0
 
 
+def configured_target_status():
+    """Local configuration state only; doctor/live sync verify Google identity."""
+    try:
+        profile = backup_target.load_profile()
+        return {"configured": True, "installation_id": profile["installation_id"],
+                "remote": profile["remote"],
+                "backup_directory": profile["backup_directory"],
+                "archive_directory": profile["archive_directory"],
+                "identity_verified": False,
+                "note": "local configuration only; use doctor for a live identity check"}
+    except (backup_target.BindingError, OSError) as exc:
+        return {"configured": False, "reason": str(exc)}
+
+
 def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1441,8 +1509,89 @@ def main(argv=None):
         commands.add_parser(name)
     enrollment = commands.add_parser("enroll")
     enrollment.add_argument("--replace", action="store_true")
+    for name in ("inspect-target", "bind-target"):
+        binding = commands.add_parser(name)
+        binding.add_argument("--rclone-config", required=True)
+        binding.add_argument("--remote", required=True)
+        binding.add_argument("--backup-dir", required=True)
+        binding.add_argument("--archive-dir", required=True)
+        binding.add_argument("--backup-folder-id", required=True)
+        binding.add_argument("--archive-folder-id", required=True)
+        if name == "bind-target":
+            binding.add_argument("--google-account-id", required=True)
+            binding.add_argument("--parent-folder-id", required=True)
+    onboard = commands.add_parser("setup-google",
+        help="Development-stage Google sign-in and default folder setup")
+    onboard.add_argument("--publisher-metadata",
+        default=str(SOURCE_ROOT / "config" / "google-publisher.json"))
+    onboard.add_argument("--rclone-config",
+        default=str(Path.home() / ".config/garmin-sync/rclone.conf"))
+    onboard.add_argument("--choose-folder", action="store_true",
+        help="Choose any writable Drive parent folder through Google Picker")
+    onboard.add_argument("--use-default", action="store_true",
+        help="Explicitly use suggested My Drive / Garmin Sync location")
     args = parser.parse_args(argv)
+    if args.command == "setup-google":
+        # Lazy import: normal device sync never depends on the onboarding UI.
+        from garmin_setup_google import setup_default, SetupError
+        from garmin_first_run import recommend_destination, interpret_destination_choice
+        try:
+            if args.choose_folder and args.use_default:
+                raise SetupError("Select only one of --choose-folder or --use-default")
+            select_picker = args.choose_folder
+            if not args.choose_folder and not args.use_default:
+                recommendation = recommend_destination(
+                    approved_profile_exists=backup_target.PROFILE_PATH.exists())
+                if recommendation is None:
+                    raise SetupError("Existing destination is pinned; deliberate rebind required")
+                print(recommendation.title)
+                print("Suggested: " + recommendation.parent_display_path)
+                print("  Current copies: " + recommendation.backup_display_path)
+                print("  Previous versions: " + recommendation.archive_display_path)
+                response = input("Enter = Use suggested location | C = Change | Q = Cancel: ")
+                choice = interpret_destination_choice(response)
+                if choice == "cancel":
+                    raise SetupError("Setup cancelled; no folders created")
+                select_picker = choice == "picker"
+            result = setup_default(
+                publisher_path=args.publisher_metadata,
+                rclone_binary=RCLONE,
+                rclone_config=Path(args.rclone_config).expanduser().absolute(),
+                choose_folder=select_picker)
+            print(json.dumps(result, indent=2))
+            return 0
+        except (SetupError, backup_target.BindingError, OSError, ValueError) as exc:
+            log("setup_refused", error=str(exc))
+            return 1
+    if args.command in ("inspect-target", "bind-target"):
+        try:
+            if args.command == "inspect-target":
+                inspected = backup_target.inspect_remote(
+                    RCLONE, backup_target.private_file(
+                        Path(args.rclone_config).expanduser().absolute()),
+                    args.remote, args.backup_dir, args.archive_dir,
+                    args.backup_folder_id, args.archive_folder_id)
+                print(json.dumps(inspected, indent=2))
+            else:
+                result = backup_target.bind_profile(
+                    RCLONE, args.rclone_config, args.remote,
+                    args.backup_dir, args.archive_dir,
+                    args.google_account_id, args.parent_folder_id,
+                    args.backup_folder_id, args.archive_folder_id)
+                print(json.dumps(result, indent=2))
+            return 0
+        except (backup_target.BindingError, OSError, subprocess.TimeoutExpired) as exc:
+            log("binding_refused", error=str(exc))
+            return 1
     if args.command == "status":
+        if IS_WINDOWS:
+            payload = {"platform": "windows", "state": State().snapshot(),
+                       "enrollment": enrolled_device(),
+                       "destination_binding": configured_target_status(),
+                       "healthy": False,
+                       "reason": "WPD/MTP and Windows credential storage qualification pending (#45)"}
+            print(json.dumps(payload, indent=2))
+            return 1
         if IS_DARWIN:
             payload = {
                 "platform": "darwin",
@@ -1452,9 +1601,10 @@ def main(argv=None):
                 "enrollment": enrolled_device(),
                 "rclone": RCLONE,
                 "mtp_tools": [MTP_FILETREE, MTP_FILES, MTP_CONNECT],
+                "destination_binding": configured_target_status(),
             }
             payload["healthy"] = bool(
-                payload["enrollment"] and Path(RCLONE).is_file() and
+                payload["enrollment"] and payload["destination_binding"]["configured"] and Path(RCLONE).is_file() and
                 all(Path(tool).is_file() for tool in payload["mtp_tools"]))
             payload["last_verified_activity"] = payload["state"].get("last_verified_activity")
             payload["sync_health"] = assess_sync_health(
@@ -1463,7 +1613,10 @@ def main(argv=None):
             return 0 if payload["healthy"] else 1
         ready, payload = readiness()
         healthy_states = {"waiting", "connected", "success", "retry_wait", "copy", "verifying", "dry-run"}
-        healthy = ready and bool(payload["enrollment"]) and payload["state"].get("status") in healthy_states
+        payload["destination_binding"] = configured_target_status()
+        healthy = (ready and bool(payload["enrollment"]) and
+                   payload["destination_binding"]["configured"] and
+                   payload["state"].get("status") in healthy_states)
         payload["healthy"] = bool(healthy)
         payload["last_verified_activity"] = payload["state"].get("last_verified_activity")
         payload["sync_health"] = assess_sync_health(
@@ -1471,6 +1624,10 @@ def main(argv=None):
         print(json.dumps(payload, indent=2))
         return 0 if healthy else 1
     if args.command == "readiness":
+        if IS_WINDOWS:
+            print(json.dumps({"ready": False, "platform": "windows",
+                              "reason": "Windows scheduler and WPD/MTP adapter not qualified"}, indent=2))
+            return 1
         if IS_DARWIN:
             print(json.dumps({"ready": False, "platform": "darwin",
                               "reason": "macOS uses manual libmtp runs, not systemd readiness"}, indent=2))
@@ -1485,7 +1642,7 @@ def main(argv=None):
     if args.command == "watch":
         return macos_watch(State())
     if args.command in ("force", "dry-run"):
-        if IS_DARWIN:
+        if IS_DARWIN or IS_WINDOWS:
             try:
                 with RunLocks():
                     return once(State(), "copy" if args.command == "force" else "dry-run")
@@ -1499,6 +1656,9 @@ def main(argv=None):
     try:
         with RunLocks():
             if args.command == "daemon":
+                if IS_WINDOWS:
+                    print("Windows Task Scheduler adapter not yet available (#45).", file=sys.stderr)
+                    return 64
                 if IS_DARWIN:
                     print("Use the macOS 'watch' command under launchd instead of daemon.",
                           file=sys.stderr)

@@ -36,7 +36,7 @@ jobs:
       - name: Static checks
         run: |
           set -euo pipefail
-          python -m py_compile garmin_sync.py garmin_fit_inspect.py tests/test_sync.py
+          python -m py_compile garmin_platform.py garmin_first_run.py garmin_sync.py garmin_backup_target.py garmin_google_oauth.py garmin_google_picker.py garmin_google_browser.py garmin_drive_provision.py garmin_setup_google.py garmin_fit_inspect.py tests/test_sync.py tests/test_backup_target.py tests/test_google_oauth.py tests/test_google_picker.py tests/test_google_browser.py tests/test_drive_provision.py tests/test_setup_google.py
           bash -n bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh scripts/install-macos-launchagent.sh
           shellcheck bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh scripts/install-macos-launchagent.sh
           command -v rg >/dev/null
@@ -50,12 +50,38 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: python -m unittest discover -s tests -v
 
+  portable-smoke:
+    name: Portable setup and host adapters (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Compile platform-neutral modules
+        run: python -m py_compile garmin_platform.py garmin_first_run.py garmin_google_oauth.py garmin_google_picker.py garmin_google_folders.py garmin_sync.py
+      - name: Cross-platform foundation tests
+        run: |
+          python -m unittest discover -s tests -p test_platform.py -v
+          python -m unittest discover -s tests -p test_first_run.py -v
+          python -m unittest discover -s tests -p test_first_run_cli.py -v
+          python -m unittest discover -s tests -p test_windows_discovery.py -v
+          python -m unittest discover -s tests -p test_google_oauth.py -v
+          python -m unittest discover -s tests -p test_google_folders.py -v
+
   deploy:
-    needs: test
+    needs: [test, portable-smoke]
     if: >-
       github.repository == 'dave0875/garminSync' &&
       github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' || inputs.confirm == 'DEPLOY_GORF')
+      github.event_name == 'workflow_dispatch' &&
+      github.actor == 'dave0875' &&
+      inputs.confirm == 'DEPLOY_GORF'
     runs-on: [self-hosted, Linux, X64, gorf, garmin-sync]
     timeout-minutes: 15
     concurrency:
@@ -68,4 +94,5 @@ jobs:
       - name: Deploy tested native-only implementation
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GARMIN_DEPLOY_CONFIRM: ${{ inputs.confirm }}
         run: scripts/deploy-gorf.sh

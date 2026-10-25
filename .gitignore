@@ -10,3 +10,11 @@ state/
 garmin-retired/
 *.log
 
+
+# Local OAuth publisher metadata and user-owned Google Drive credentials.
+# Do not commit test-app credentials, refresh tokens or installation bindings.
+/config/google-publisher.json
+/config/*client*secret*.json
+**/rclone.conf
+**/installation.json
+**/oauth-token*.json
