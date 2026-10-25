@@ -58,13 +58,6 @@ def setup_default(*, publisher_path, rclone_binary, rclone_config,
     if Path(rclone_config).exists() or Path(rclone_config).is_symlink():
         raise SetupError("Private rclone config exists; choose safe migration instead")
     client_id, client_secret = publisher_metadata(publisher_path)
-    prompt = ("Connect Google, select a Drive folder, and create Backups "
-              "and Archive inside it? Type CREATE: " if choose_folder else
-              "Connect Google and create Garmin Sync/Backups and "
-              "Garmin Sync/Archive in your Drive? Type CREATE: ")
-    choice = confirm(prompt)
-    if choice != "CREATE":
-        raise SetupError("Setup cancelled; no Google Drive folder created")
     # No app-hosted callback, and no browser receives the resulting refresh token.
     if choose_folder:
         tokens, selected_parent_id = authorize(client_id, choose_folder=True)
@@ -72,6 +65,14 @@ def setup_default(*, publisher_path, rclone_binary, rclone_config,
         tokens = authorize(client_id)
     oauth.validate_token_response(tokens)
     account = google_principal(tokens["access_token"])
+    shown_account = account.get("email") or account["permission_id"]
+    destination_note = ("your Google Picker-selected folder" if choose_folder
+                        else "a new Garmin Sync folder in My Drive")
+    decision = confirm(
+        f"Authenticated Google account: {shown_account}. Create backup/archive "
+        f"folders inside {destination_note}? Type CREATE to confirm: ")
+    if decision != "CREATE":
+        raise SetupError("Setup cancelled; no Google Drive folder created")
     layout = (drive.create_selected_layout(
         tokens["access_token"], selected_parent_id, confirmed=True)
         if choose_folder else drive.create_default_layout(
