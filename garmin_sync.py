@@ -1488,7 +1488,26 @@ def main(argv=None):
         if name == "bind-target":
             binding.add_argument("--google-account-id", required=True)
             binding.add_argument("--parent-folder-id", required=True)
+    onboard = commands.add_parser("setup-google",
+        help="Development-stage Google sign-in and default folder setup")
+    onboard.add_argument("--publisher-metadata",
+        default=str(SOURCE_ROOT / "config" / "google-publisher.json"))
+    onboard.add_argument("--rclone-config",
+        default=str(Path.home() / ".config/garmin-sync/rclone.conf"))
     args = parser.parse_args(argv)
+    if args.command == "setup-google":
+        # Lazy import: normal device sync never depends on the onboarding UI.
+        from garmin_setup_google import setup_default, SetupError
+        try:
+            result = setup_default(
+                publisher_path=args.publisher_metadata,
+                rclone_binary=RCLONE,
+                rclone_config=Path(args.rclone_config).expanduser().absolute())
+            print(json.dumps(result, indent=2))
+            return 0
+        except (SetupError, backup_target.BindingError, OSError, ValueError) as exc:
+            log("setup_refused", error=str(exc))
+            return 1
     if args.command in ("inspect-target", "bind-target"):
         try:
             if args.command == "inspect-target":
