@@ -79,8 +79,11 @@ def consume_callback(attempt, request_target):
         raise OAuthError("OAuth state does not match this installation")
     if "error" in params:
         raise OAuthError("Google authorization was declined or interrupted")
-    if set(params) != {"code", "state"}:
+    if not set(params).issubset({"code", "state", "scope"}):
         raise OAuthError("Unexpected OAuth response parameters")
+    if "scope" in params and (len(params["scope"]) != 1 or
+                              set(params["scope"][0].split()) != {DRIVE_SCOPE}):
+        raise OAuthError("OAuth callback scope exceeds drive.file")
     codes = params.get("code")
     if not codes or len(codes) != 1 or not codes[0] or len(codes[0]) > 2048:
         raise OAuthError("Missing or duplicated Google authorization code")
@@ -94,7 +97,7 @@ def validate_token_response(payload):
     scopes = payload.get("scope")
     if not isinstance(scopes, str) or set(scopes.split()) != {DRIVE_SCOPE}:
         raise OAuthError("Google OAuth scope differs from the approved drive.file scope")
-    if payload.get("token_type", "").lower() != "bearer":
+    if not isinstance(payload.get("token_type"), str) or payload["token_type"].lower() != "bearer":
         raise OAuthError("Expected bearer token")
     for name in ("access_token", "refresh_token"):
         if not isinstance(payload.get(name), str) or not payload[name]:
