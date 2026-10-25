@@ -41,6 +41,31 @@ default, and FIT decoding is diagnostic only. Maps, firmware/unlock files,
 music, videos and image media are excluded; `Activity`, `Monitor`, `Metrics`,
 `HRVStatus`, `Sleep`, and `Debug/MetricsBackup` are eligible when present.
 
+## Experimental consumer onboarding (not yet publicly usable)
+
+The draft feature branch now contains an opt-in `setup-google` command which,
+**once a real publisher-owned Desktop OAuth client is supplied**, opens Google
+in the system browser, authenticates through PKCE/loopback, presents the actual
+Google account for confirmation, and creates a private rclone remote and pinned
+Drive folder binding. It supports either an app-created default parent or a
+user-selected parent through Google Picker. No independent `rclone config`
+is required for this experimental path.
+
+```bash
+# Development-only. Requires a real publisher-issued config/google-publisher.json:
+python3 garmin_sync.py setup-google
+
+# Ask Google Picker to choose any writable parent folder:
+python3 garmin_sync.py setup-google --choose-folder
+```
+
+**Do not use this against production accounts yet.** No publisher OAuth
+client/consent verification has been shipped; the browser-based setup wizard
+and native keyring policies remain incomplete. The development CLI deliberately
+fails closed without publisher metadata. OAuth secrets are currently written
+to a private 0600 rclone configuration for test integration, pending secure
+OS credential-store qualification. See #39-#43 and the ADR.
+
 ## First-time setup
 
 Install Python 3.12+, rclone, and the OS-specific USB transport dependencies.
