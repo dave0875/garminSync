@@ -24,7 +24,9 @@ class FolderTests(unittest.TestCase):
         self.assertEqual(len(body["parents"]), 1)
         return io.BytesIO(json.dumps({
             "id": next(self.identities), "name": body["name"],
-            "mimeType": MIME, "parents": body["parents"],
+            "mimeType": MIME,
+            "parents": ["actualRootFolder123"] if body["parents"] == ["root"]
+                       else body["parents"],
         }).encode())
 
     def test_requires_explicit_user_approval(self):
