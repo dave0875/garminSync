@@ -51,7 +51,8 @@ def _post_folder(access_token, parent_id, name, http=None):
         raise FolderProvisionError("Drive folder creation did not complete") from exc
     if (not isinstance(result, dict) or result.get("name") != name or
             result.get("mimeType") != DRIVE_DIRECTORY or
-            parent_id not in (result.get("parents") or [])):
+            not (result.get("parents") if parent_id == "root" else
+                 parent_id in (result.get("parents") or []))):
         raise FolderProvisionError("Google returned unexpected folder metadata")
     try:
         folder_id = valid_folder(result.get("id"))
