@@ -46,7 +46,8 @@ def google_principal(access_token):
 
 def setup_default(*, publisher_path, rclone_binary, rclone_config,
                   profile_path=target.PROFILE_PATH,
-                  confirm=input, authorize=browser.authorize_with_browser):
+                  confirm=input, authorize=browser.authorize_with_browser,
+                  choose_folder=False):
     """Authorize Google, create app-owned folder layout, and bind after verification.
 
     Never substitute ambient Google credentials, replace an existing profile,
@@ -57,16 +58,24 @@ def setup_default(*, publisher_path, rclone_binary, rclone_config,
     if Path(rclone_config).exists() or Path(rclone_config).is_symlink():
         raise SetupError("Private rclone config exists; choose safe migration instead")
     client_id, client_secret = publisher_metadata(publisher_path)
-    choice = confirm(
-        "Connect Google and create 'Garmin Sync/Backups' and "
-        "'Garmin Sync/Archive' in your Google Drive? Type CREATE: ")
+    prompt = ("Connect Google, select a Drive folder, and create Backups "
+              "and Archive inside it? Type CREATE: " if choose_folder else
+              "Connect Google and create Garmin Sync/Backups and "
+              "Garmin Sync/Archive in your Drive? Type CREATE: ")
+    choice = confirm(prompt)
     if choice != "CREATE":
         raise SetupError("Setup cancelled; no Google Drive folder created")
     # No app-hosted callback, and no browser receives the resulting refresh token.
-    tokens = authorize(client_id)
+    if choose_folder:
+        tokens, selected_parent_id = authorize(client_id, choose_folder=True)
+    else:
+        tokens = authorize(client_id)
     oauth.validate_token_response(tokens)
     account = google_principal(tokens["access_token"])
-    layout = drive.create_default_layout(tokens["access_token"], confirmed=True)
+    layout = (drive.create_selected_layout(
+        tokens["access_token"], selected_parent_id, confirmed=True)
+        if choose_folder else drive.create_default_layout(
+            tokens["access_token"], confirmed=True))
     drive.create_private_rclone_config(
         rclone_config, client_id=client_id, client_secret=client_secret,
         token_response=tokens, parent_folder_id=layout["parent_folder_id"])
