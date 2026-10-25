@@ -69,6 +69,8 @@ jobs:
         run: |
           python -m unittest discover -s tests -p test_platform.py -v
           python -m unittest discover -s tests -p test_first_run.py -v
+          python -m unittest discover -s tests -p test_first_run_cli.py -v
+          python -m unittest discover -s tests -p test_windows_discovery.py -v
           python -m unittest discover -s tests -p test_google_oauth.py -v
           python -m unittest discover -s tests -p test_google_folders.py -v
 
