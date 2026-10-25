@@ -376,11 +376,23 @@ def discover(mount_paths=(), uid=None, username=None, expected_identity=None):
         except OSError:
             pass
     found = []
+    seen_physical_roots = set()
     for base in bases:
         for root in candidate_roots(base):
             item = model_at(root)
             if item:
-                found.append(item)
+                # Windows/macOS may have case-insensitive volumes: GARMIN,
+                # Garmin and garmin can refer to the same actual directory.
+                # Count the real filesystem identity once, not the spellings.
+                try:
+                    st = root.stat()
+                    identity_key = ((st.st_dev, st.st_ino) if st.st_ino
+                                    else str(root).casefold())
+                except OSError:
+                    identity_key = str(root).casefold()
+                if identity_key not in seen_physical_roots:
+                    seen_physical_roots.add(identity_key)
+                    found.append(item)
     if len(found) > 1:
         log("multiple_devices", sources=[item["root"] for item in found])
         raise DiscoveryError("Multiple Garmin devices detected; connect only the enrolled device")
