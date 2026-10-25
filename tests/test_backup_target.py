@@ -253,7 +253,7 @@ class SameRemoteArchiveFixture(unittest.TestCase):
                             "--backup-dir", "localuser:Archive/run-1", "--config",
                             str(config), "--checksum"], check=True,
                            env={**target.clean_rclone_environment()},
-                           capture_output=True, cwd=root)
+                           capture_output=True, cwd=root / "drive")
             self.assertEqual(destination.joinpath("Activity", "one.fit").read_bytes(),
                              b"new version")
             self.assertEqual(archive.joinpath("Activity", "one.fit").read_bytes(),
