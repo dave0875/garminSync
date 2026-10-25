@@ -89,6 +89,36 @@ def create_default_layout(access_token, *, confirmed=False,
             "archive_directory": archive_name}
 
 
+def create_selected_layout(access_token, selected_parent_id, *,
+                           confirmed=False, backup_name="Backups",
+                           archive_name="Archive"):
+    """Provision children inside a Picker-granted parent after explicit opt-in.
+
+    Picker grants access to the chosen parent; never infer that arbitrary
+    unrelated existing children become visible under drive.file.
+    """
+    if confirmed is not True:
+        raise SetupError("Explicit confirmation required for selected Drive folder")
+    parent_id = target.valid_folder(selected_parent_id)
+    for value in (backup_name, archive_name):
+        target.valid_child(value)
+    if backup_name.casefold() == archive_name.casefold():
+        raise SetupError("Backup and archive folders must differ")
+    query = urllib.parse.urlencode({
+        "fields": "id,mimeType,trashed,capabilities(canAddChildren)"})
+    parent = _drive_json(access_token, DRIVE_FILES + "/" +
+                         urllib.parse.quote(parent_id, safe="") + "?" + query)
+    if (parent.get("id") != parent_id or parent.get("trashed") or
+            parent.get("mimeType") != FOLDER_MIME or
+            not (parent.get("capabilities") or {}).get("canAddChildren")):
+        raise SetupError("Selected Drive folder is not accessible and writable")
+    backup_id = create_folder(access_token, backup_name, parent_id)
+    archive_id = create_folder(access_token, archive_name, parent_id)
+    return {"parent_folder_id": parent_id, "backup_folder_id": backup_id,
+            "archive_folder_id": archive_id, "backup_directory": backup_name,
+            "archive_directory": archive_name}
+
+
 def rclone_token(token_response):
     token = oauth.validate_token_response(token_response)
     expiry = (dt.datetime.now(dt.timezone.utc) +
