@@ -66,6 +66,34 @@ class LoopbackTests(unittest.TestCase):
             self.assertFalse(worker.is_alive())
         exchange.assert_not_called()
 
+    def test_picker_one_folder_round_trip_over_localhost(self):
+        threads = []
+        folder = "pickedFolderABC12345"
+        def open_fake_browser(url):
+            query = parse_qs(urlsplit(url).query)
+            redirect = query["redirect_uri"][0]
+            def send():
+                callback = redirect + "?" + urlencode({
+                    "code": "picker-code", "state": query["state"][0],
+                    "scope": oauth.DRIVE_SCOPE, "picked_file_ids": folder})
+                with urllib.request.urlopen(callback, timeout=2) as response:
+                    self.assertEqual(response.status, 200)
+            t = threading.Thread(target=send)
+            threads.append(t)
+            t.start()
+            return True
+        with mock.patch.object(browser.webbrowser, "open", side_effect=open_fake_browser), \
+             mock.patch.object(oauth, "exchange_code",
+                               return_value={"access_token": "mock-token"}) as exchange:
+            token, selected = browser.authorize_with_browser(
+                CLIENT, choose_folder=True, timeout_seconds=4)
+        for thread in threads:
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(selected, folder)
+        self.assertEqual(token["access_token"], "mock-token")
+        exchange.assert_called_once()
+
     def test_rejects_bad_timeout(self):
         for timeout in (0, -5, 601):
             with self.subTest(timeout=timeout), self.assertRaises(oauth.OAuthError):
