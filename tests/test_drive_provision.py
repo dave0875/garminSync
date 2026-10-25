@@ -51,6 +51,34 @@ class ProvisionTests(unittest.TestCase):
         self.assertNotEqual(value["backup_folder_id"], value["archive_folder_id"])
         self.assertEqual(value["backup_directory"], "Backups")
 
+    def test_selected_parent_creates_only_children_and_requires_writability(self):
+        selected = "userSelectedParent12345"
+        requests = []
+        def fake_api(_token, url, payload=None):
+            requests.append((url, payload))
+            if payload is None:
+                return {"id": selected, "mimeType": provision.FOLDER_MIME,
+                        "capabilities": {"canAddChildren": True}}
+            name = payload["name"]
+            return {"id": {"Backups": "appBackupFolder0001",
+                           "Archive": "appArchiveFolder002"}[name],
+                    "name": name, "mimeType": provision.FOLDER_MIME,
+                    "parents": [selected]}
+        with mock.patch.object(provision, "_drive_json", side_effect=fake_api):
+            layout = provision.create_selected_layout(
+                "token", selected, confirmed=True)
+        self.assertEqual(layout["parent_folder_id"], selected)
+        self.assertEqual(len(requests), 3)
+        self.assertTrue(all(call[1]["parents"] == [selected]
+                            for call in requests[1:]))
+
+        def refused(*_args, **_kwargs):
+            return {"id": selected, "mimeType": provision.FOLDER_MIME,
+                    "capabilities": {"canAddChildren": False}}
+        with mock.patch.object(provision, "_drive_json", side_effect=refused):
+            with self.assertRaises(provision.SetupError):
+                provision.create_selected_layout("token", selected, confirmed=True)
+
     def test_unsafe_layout_name_is_rejected_without_api_call(self):
         with mock.patch.object(provision, "_drive_json") as call:
             with self.assertRaises(target.BindingError):
