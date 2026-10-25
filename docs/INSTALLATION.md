@@ -1,102 +1,128 @@
-# Garmin Sync installation: advanced transitional procedure
+# Transitional installation and explicit Drive-folder binding
 
-> **DRAFT PR #37. NOT YET PRODUCTION-READY.** This manual setup is a temporary
-> engineering interface. The consumer setup wizard and Google sign-in are
-> tracked in #39–#43 and designed in
-> [ADR-0001](ADR-0001-consumer-onboarding-google-oauth.md).
-> Never deploy this branch to GORF without completing the non-destructive
-> legacy migration review and isolated-account Drive testing.
+> **Draft PR #37 only. Not a production release.** This is an advanced/manual
+> migration procedure while the first-party Google OAuth and guided setup flow
+> are implemented in issues #39-#43. A new end user should ultimately connect
+> Google via the system browser and choose their folder without touching rclone.
+> Do not use this draft to migrate GORF until independent real-account tests and
+> GORF-specific read-only qualification have been completed.
 
-## Core behavior
+## What is configurable?
 
-Any supported Garmin exposing a valid, stable ID in \`GarminDevice.xml\` can be
-enrolled. Fenix 8 and the historical Google Drive folder names are NOT
-required. **The owner chooses any existing writable Google Drive parent
-folder.** Under that folder, Garmin Sync uses two sibling child folders for
-Backups and Archive. Backups and archive must be in the same rclone remote
-because \`rclone copy --backup-dir\` requires that property.
+Garmin Sync supports compatible Garmin devices exposing `GarminDevice.xml`
+through a supported USB/MTP transport. The model is discovered from the device.
+A different device cannot upload unless explicitly enrolled.
 
-Each installation pins the account's stable Drive permission ID, parent ID,
-backup child ID, archive child ID, and exact child folder names. A removed,
-recreated, renamed, repointed, unwritable or ambiguously resolved child stops
-the sync. A path with a matching name but a different Drive ID cannot be used.
+Each installation chooses a **parent directory anywhere in its own Google
+Drive**. Within that parent, there must be two separate, explicitly approved
+folders: one for active backups, one for history/archive. The folders may have
+user-chosen names. Their Google IDs, parent ID, and principal ID are pinned.
 
-## Advanced manual setup while the consumer wizard is incomplete
+**Important:** `rclone copy --backup-dir` requires the destination and archive
+to share one remote. Do NOT configure independent `backup:` and `archive:`
+remotes. An approved configuration instead maps one remote to the parent:
 
-1. Authorize a **dedicated**, owner-private rclone OAuth configuration, not a
-   shared \`~/.config/rclone/rclone.conf\`. Do not copy tokens from another user.
+```text
+userdrive:                        Google Drive parent_folder_id
+  Watch Backup/                  backup_folder_id
+  Retained History/              archive_folder_id
+    <run-id>/                    overwritten-file versions
+```
 
-   \`\`\`bash
-   install -d -m 700 "$HOME/.config/garmin-sync"
-   rclone --config "$HOME/.config/garmin-sync/rclone.conf" config
-   chmod 600 "$HOME/.config/garmin-sync/rclone.conf"
-   \`\`\`
+A later folder rename, account change or recreated directory is blocked until
+the user explicitly repairs/rebinds the installation. The program never falls
+back to the logged-in user's ambient `gdrive:`.
 
-2. In that configuration create **one** Google Drive remote (for example
-   \`my-garmin\`) with \`root_folder_id\` pointing to the selected existing
-   **parent folder**. The existing \`Backups\` and \`Archive\` children must
-   already exist under that parent. Choose any safe single-component names,
-   but the names must differ. Record the three folder IDs via Google Drive's
-   folder URLs. The remotes must be OAuth Drive, not service-account or
-   shared-drive remotes. Do not use \`gdrive:\` from another profile.
+## Manual transitional setup (test accounts only)
 
-3. Inspect without transferring bytes. This outputs Google account identity
-   and three verified Drive folder IDs:
+Create the parent, active and archive folders in the intended Drive account.
+Use their real IDs from Google Drive folder URLs. Configure exactly one private
+rclone Google Drive remote rooted at the selected parent folder's ID:
 
-   \`\`\`bash
-   python3 garmin_sync.py inspect-target \
-     --rclone-config "$HOME/.config/garmin-sync/rclone.conf" \
-     --remote my-garmin --backup-path Backups --archive-path Archive
-   \`\`\`
+```bash
+install -d -m 700 "$HOME/.config/garmin-sync"
+rclone --config "$HOME/.config/garmin-sync/rclone.conf" config
+chmod 600 "$HOME/.config/garmin-sync/rclone.conf"
+```
 
-4. After reviewing the results, bind the installation explicitly:
+Configure its alias as `userdrive`, type `drive`, and set
+`root_folder_id = <PARENT_FOLDER_ID>`. For now this requires the operator to
+authenticate using rclone. The public consumer release will automate OAuth
+and private rclone provisioning (issues #39/#40).
 
-   \`\`\`bash
-   python3 garmin_sync.py bind-target \
-     --rclone-config "$HOME/.config/garmin-sync/rclone.conf" \
-     --remote my-garmin --backup-path Backups --archive-path Archive \
-     --google-account-id "<VERIFIED_PERMISSION_ID>" \
-     --parent-folder-id "<VERIFIED_PARENT_ID>" \
-     --backup-folder-id "<VERIFIED_BACKUP_ID>" \
-     --archive-folder-id "<VERIFIED_ARCHIVE_ID>"
-   \`\`\`
+Review the account and child folder identities via read-only API calls:
 
-   \`~/.config/garmin-sync/installation.json\` is generated privately with a
-   new installation UUID. \`schema_version: 2\` replaces the obsolete
-   two-independent-remote v1 schema. There is **no automatic v1 promotion**
-   because its archive contract was invalid.
+```bash
+python3 garmin_sync.py inspect-target \
+  --rclone-config "$HOME/.config/garmin-sync/rclone.conf" \
+  --remote userdrive \
+  --backup-dir 'Watch Backup' --archive-dir 'Retained History' \
+  --backup-folder-id '<BACKUP_FOLDER_ID>' \
+  --archive-folder-id '<ARCHIVE_FOLDER_ID>'
+```
 
-5. Connect the target Garmin, enroll its identity, and first run a preview:
+The inspected principal ID and parent ID must be independently checked against
+the operator's intended account and folder before binding. The read-only
+inspection also checks direct parent relationships and duplicate child folder
+names. Do not copy unknown IDs or rclone credentials from a third party.
 
-   \`\`\`bash
-   python3 garmin_sync.py enroll
-   python3 garmin_sync.py once --dry-run
-   python3 garmin_sync.py once
-   python3 garmin_sync.py verify
-   \`\`\`
+Explicitly approve and bind:
 
-No account, selected Drive folder, archive folder or watch identity is ever
-silently rebound. Missing credentials or a failed account/folder probe blocks
-all Drive mutations. A \`once --dry-run\` is a preview, **not** proof of backup.
-Only a successful copy plus checksum check qualifies as verified.
+```bash
+python3 garmin_sync.py bind-target \
+  --rclone-config "$HOME/.config/garmin-sync/rclone.conf" \
+  --remote userdrive \
+  --backup-dir 'Watch Backup' --archive-dir 'Retained History' \
+  --backup-folder-id '<BACKUP_FOLDER_ID>' \
+  --archive-folder-id '<ARCHIVE_FOLDER_ID>' \
+  --parent-folder-id '<PARENT_FOLDER_ID>' \
+  --google-account-id '<VERIFIED_PERMISSION_ID>'
+```
 
-## Historic GORF migration
+The private `installation.json` uses schema v2 and is immutable on ordinary
+startup. Unsupported older v1/two-remote profiles fail closed and must be
+rebound deliberately. No automatic migration or fallback.
 
-The existing data locations are \`Garmin/Fenix8_Backup\` and
-\`Garmin/Fenix8_Archive\`. Their existing parent \`Garmin\` must be the
-single \`root_folder_id\`. The child paths must be **exactly**
-\`Fenix8_Backup\` and \`Fenix8_Archive\`, pinned to their original IDs.
-No folder may be moved, renamed, created as a substitute, cleared or
-re-uploaded for migration.
+Connect one supported Garmin device, then:
 
-GORF may use legacy Google OAuth scopes. \`drive.file\` is for **new** users;
-it does not necessarily grant access to existing foreign-created Drive files.
-Keep the legacy credential scope until read-only inventory, account identity,
-archive, device data, and rollback are independently qualified. Do not
-run this migration through CI or a repo-connected runner with production tokens.
-Owner-only deployment is manual and must follow that independent qualification.
+```bash
+python3 garmin_sync.py enroll
+python3 garmin_sync.py once --dry-run
+python3 garmin_sync.py once
+python3 garmin_sync.py doctor
+```
 
-The consumer release will replace the manual rclone setup with Google's
-browser consent, secure local credential handling, automatic folder creation,
-Google Picker and OS-appropriate service activation. **None of those external
-publishing requirements is satisfied merely by this manual guide.**
+These commands do **not** run unless watch enrollment and destination
+authorization requirements are met.
+
+## GORF and legacy archive migration
+
+Current GORF Google Drive:
+`Garmin/Fenix8_Backup` and `Garmin/Fenix8_Archive`.
+These are **existing sibling folders** with valuable historical data. When
+qualifying migration, the new **one** remote should be rooted at the
+existing `Garmin` parent ID and use:
+
+- backup directory: `Fenix8_Backup` (same existing ID)
+- archive directory: `Fenix8_Archive` (same existing ID)
+
+Do not create replacement folders, move, delete or re-upload existing objects.
+The legacy Drive OAuth scopes may see existing files that a new `drive.file`
+client cannot see. A scope change therefore requires its own compatibility
+assessment. No production Drive mutations during preflight.
+
+The guarded GORF deployer only permits an explicit owner-authorized,
+main-branch manual deployment with approved credentials and pre-bound
+configuration. It is intentionally **not** triggered by a draft PR.
+
+## Privacy and protection
+
+The enrolled Garmin device is read-only. FIT decoding is diagnostic.
+Destination-only files are retained, overwritten destination files are
+archived, and final checks prove verified copies before marking success.
+
+Profile and rclone files are private to the local operating-system user.
+Do not use production OAuth tokens in CI, GitHub issues, screenshots,
+support bundles, or public recordings. For broader release, the architecture
+uses a publisher-owned Desktop OAuth client, PKCE, Google Picker and
+`drive.file` scope; see [ADR-0001](ADR-0001-consumer-onboarding-google-oauth.md).
