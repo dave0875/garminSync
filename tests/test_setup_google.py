@@ -86,6 +86,27 @@ class SetupTests(unittest.TestCase):
         self.assertNotIn("private-refresh", str(output))
         self.assertEqual(bind.call_args.args[3], ACCOUNT["permission_id"])
 
+    def test_picker_mode_uses_exact_selected_parent_without_manual_ids(self):
+        calls = []
+        selected = "pickerSelectedFolder01234"
+        def authorize(client_id, **options):
+            calls.append(("authorize", client_id, options))
+            return TOKEN, selected
+        with mock.patch.object(setup, "google_principal", return_value=ACCOUNT), \
+             mock.patch.object(setup.drive, "create_selected_layout",
+                               return_value=LAYOUT) as create, \
+             mock.patch.object(setup.drive, "create_private_rclone_config"), \
+             mock.patch.object(setup.drive, "bind_created_layout",
+                               return_value={"installation_id": "uuid"}):
+            result = setup.setup_default(
+                publisher_path=self.metadata, rclone_binary="rclone",
+                rclone_config=self.config, profile_path=self.profile,
+                confirm=lambda _: "CREATE", authorize=authorize,
+                choose_folder=True)
+        self.assertTrue(result["ready_for_device_enrollment"])
+        self.assertEqual(calls[0][2], {"choose_folder": True})
+        self.assertEqual(create.call_args.args[1], selected)
+
     def test_wrong_auth_scope_fails_before_any_folder_creation(self):
         with mock.patch.object(setup.drive, "create_default_layout") as create:
             with self.assertRaises(oauth.OAuthError):
