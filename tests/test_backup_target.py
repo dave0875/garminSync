@@ -249,8 +249,8 @@ class SameRemoteArchiveFixture(unittest.TestCase):
             destination.joinpath("Activity", "one.fit").write_bytes(b"old version")
             config = root / "local-rclone.conf"
             config.write_text("[localuser]\ntype=local\n")
-            subprocess.run([sync.RCLONE, "copy", str(source), "localuser:Backups",
-                            "--backup-dir", "localuser:Archive/run-1", "--config",
+            subprocess.run([sync.RCLONE, "copy", str(source), "localuser:" + str(destination),
+                            "--backup-dir", "localuser:" + str(archive), "--config",
                             str(config), "--checksum"], check=True,
                            env={**target.clean_rclone_environment()},
                            capture_output=True, cwd=root / "drive")
