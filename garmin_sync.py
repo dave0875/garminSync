@@ -1455,8 +1455,9 @@ def configured_target_status():
     try:
         profile = backup_target.load_profile()
         return {"configured": True, "installation_id": profile["installation_id"],
-                "backup_remote": profile["backup_remote"],
-                "archive_remote": profile["archive_remote"],
+                "remote": profile["remote"],
+                "backup_path": profile["backup_path"],
+                "archive_path": profile["archive_path"],
                 "identity_verified": False,
                 "note": "local configuration only; use doctor for a live identity check"}
     except (backup_target.BindingError, OSError) as exc:
@@ -1479,25 +1480,29 @@ def main(argv=None):
     for name in ("inspect-target", "bind-target"):
         binding = commands.add_parser(name)
         binding.add_argument("--rclone-config", required=True)
-        binding.add_argument("--backup-remote", required=True)
-        binding.add_argument("--archive-remote", required=True)
+        binding.add_argument("--remote", required=True)
+        binding.add_argument("--backup-path", required=True)
+        binding.add_argument("--archive-path", required=True)
         if name == "bind-target":
             binding.add_argument("--google-account-id", required=True)
+            binding.add_argument("--parent-folder-id", required=True)
             binding.add_argument("--backup-folder-id", required=True)
             binding.add_argument("--archive-folder-id", required=True)
     args = parser.parse_args(argv)
     if args.command in ("inspect-target", "bind-target"):
         try:
             if args.command == "inspect-target":
-                inspected = backup_target.inspect_remotes(
+                inspected = backup_target.inspect_target(
                     RCLONE, backup_target.private_file(
                         Path(args.rclone_config).expanduser().absolute()),
-                    args.backup_remote, args.archive_remote)
+                    args.remote, args.backup_path, args.archive_path)
                 print(json.dumps(inspected, indent=2))
             else:
                 result = backup_target.bind_profile(
-                    RCLONE, args.rclone_config, args.backup_remote, args.archive_remote,
-                    args.google_account_id, args.backup_folder_id, args.archive_folder_id)
+                    RCLONE, args.rclone_config, args.remote,
+                    args.backup_path, args.archive_path, args.google_account_id,
+                    args.parent_folder_id, args.backup_folder_id,
+                    args.archive_folder_id)
                 print(json.dumps(result, indent=2))
             return 0
         except (backup_target.BindingError, OSError, subprocess.TimeoutExpired) as exc:
