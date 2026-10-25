@@ -166,3 +166,12 @@ Rclone's documented `--backup-dir` option requires the **same remote** as the co
 6. Obtain Google publishing approval and qualification evidence. Only then consider public release or explicit, reversible GORF cutover.
 
 **Out of scope for the first release:** cloud-hosted user accounts, Google password handling, Garmin Connect cloud, syncing to unrelated consumer cloud providers, automatic account rebinding, and a promise that every Garmin USB mode is compatible.
+
+
+## 10. Cross-platform first-run default and supported host contract
+
+**Accepted UX contract:** The same cloud recommendation on Linux, macOS and Windows is `My Drive / Garmin Sync`. First-run setup must show **Use suggested location** (primary, one-click/Enter) and **Change location** (Google Picker) plus the actual Google account identity. The application then automatically creates/uses sibling `Backups` and `Archive` children beneath the selected folder. Archive retention is an advanced opt-in policy, not an extra folder choice. No local Windows/Mac/Linux Documents or Downloads default, because the backup target is the user's Google Drive. Never create or modify cloud folders until the user explicitly chooses and confirms, and never reapply default when an installation already has pinned IDs.
+
+**OS-specific local data vs cloud selection:** The cloud destination is identical across OSes but installation secrets, locks, device acquisition and background activation use native adapters. Preserve existing Linux GORF and macOS local locations until explicit migration. Windows local metadata belongs under `%LOCALAPPDATA%/GarminSync`, and protected OAuth credentials must use Windows-secured storage, not unverified POSIX mode bits.
+
+**Windows is an explicit product requirement, not merely a CI label.** See [PLATFORMS.md](PLATFORMS.md) and issue #45. A true Windows release requires native WPD/MTP Garmin transport for devices with no drive letter, safe file snapshots, Windows locks, non-admin Task Scheduler background operations, ACL/DPAPI-protected credentials, an installer, and real USB plus Drive sandbox UAT. Cross-OS smoke checks are necessary but not sufficient for Windows support. Issue #44 tracks easy default and Picker choice; #43 is expanded to Linux, macOS and Windows install.
