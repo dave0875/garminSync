@@ -54,6 +54,22 @@ class SetupTests(unittest.TestCase):
                 self.invoke("NO")
             create.assert_not_called()
 
+    def test_shows_authenticated_account_before_any_folder_creation(self):
+        prompts = []
+        def confirm(prompt):
+            prompts.append(prompt)
+            return "NO"
+        with mock.patch.object(setup, "google_principal", return_value=ACCOUNT), \
+             mock.patch.object(setup.drive, "create_default_layout") as created:
+            with self.assertRaisesRegex(setup.SetupError, "cancelled"):
+                setup.setup_default(
+                    publisher_path=self.metadata, rclone_binary="rclone",
+                    rclone_config=self.config, profile_path=self.profile,
+                    confirm=confirm, authorize=lambda _: TOKEN)
+            created.assert_not_called()
+        self.assertIn(ACCOUNT["email"], prompts[0])
+        self.assertFalse(self.profile.exists())
+
     def test_preexisting_config_and_profile_fail_before_google_mutation(self):
         self.config.write_text("private")
         with mock.patch.object(setup.drive, "create_default_layout") as create:
