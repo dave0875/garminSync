@@ -19,7 +19,9 @@ import urllib.parse
 import urllib.request
 import uuid
 
-PROFILE_PATH = Path.home() / ".config/garmin-sync/installation.json"
+import garmin_platform
+
+PROFILE_PATH = garmin_platform.user_paths()["config"] / "installation.json"
 REMOTE_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 FOLDER_ID = re.compile(r"^[A-Za-z0-9_-]{10,200}$")
 DRIVE_DIRECTORY = "application/vnd.google-apps.folder"
@@ -45,6 +47,10 @@ def private_file(path):
         st = path.stat()
     except OSError as exc:
         raise BindingError("Required private configuration is unavailable") from exc
+    if garmin_platform.host_family() == "windows":
+        # POSIX chmod and st_uid do NOT validate Windows token-file ACLs.
+        # No production credential-backed writes until DPAPI/ACL adapter (#45).
+        raise BindingError("Windows credential ACL isolation is awaiting qualification (#45)")
     if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
         raise BindingError("Configuration must be a regular file owned by this user")
     if st.st_mode & 0o077:
