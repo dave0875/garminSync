@@ -1496,16 +1496,36 @@ def main(argv=None):
         default=str(Path.home() / ".config/garmin-sync/rclone.conf"))
     onboard.add_argument("--choose-folder", action="store_true",
         help="Choose any writable Drive parent folder through Google Picker")
+    onboard.add_argument("--use-default", action="store_true",
+        help="Explicitly use suggested My Drive / Garmin Sync location")
     args = parser.parse_args(argv)
     if args.command == "setup-google":
         # Lazy import: normal device sync never depends on the onboarding UI.
         from garmin_setup_google import setup_default, SetupError
+        from garmin_first_run import recommend_destination, interpret_destination_choice
         try:
+            if args.choose_folder and args.use_default:
+                raise SetupError("Select only one of --choose-folder or --use-default")
+            select_picker = args.choose_folder
+            if not args.choose_folder and not args.use_default:
+                recommendation = recommend_destination(
+                    approved_profile_exists=backup_target.PROFILE_PATH.exists())
+                if recommendation is None:
+                    raise SetupError("Existing destination is pinned; deliberate rebind required")
+                print(recommendation.title)
+                print("Suggested: " + recommendation.parent_display_path)
+                print("  Current copies: " + recommendation.backup_display_path)
+                print("  Previous versions: " + recommendation.archive_display_path)
+                response = input("Enter = Use suggested location | C = Change | Q = Cancel: ")
+                choice = interpret_destination_choice(response)
+                if choice == "cancel":
+                    raise SetupError("Setup cancelled; no folders created")
+                select_picker = choice == "picker"
             result = setup_default(
                 publisher_path=args.publisher_metadata,
                 rclone_binary=RCLONE,
                 rclone_config=Path(args.rclone_config).expanduser().absolute(),
-                choose_folder=args.choose_folder)
+                choose_folder=select_picker)
             print(json.dumps(result, indent=2))
             return 0
         except (SetupError, backup_target.BindingError, OSError, ValueError) as exc:
