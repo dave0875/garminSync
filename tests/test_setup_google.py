@@ -49,7 +49,8 @@ class SetupTests(unittest.TestCase):
             create.assert_not_called()
 
     def test_user_must_confirm_before_browser_or_folder_creation(self):
-        with mock.patch.object(setup.drive, "create_default_layout") as create:
+        with mock.patch.object(setup, "google_principal", return_value=ACCOUNT), \
+             mock.patch.object(setup.drive, "create_default_layout") as create:
             with self.assertRaisesRegex(setup.SetupError, "cancelled"):
                 self.invoke("NO")
             create.assert_not_called()
