@@ -4,7 +4,6 @@
 import argparse
 import contextlib
 import datetime as dt
-import fcntl
 import getpass
 import hashlib
 import json
@@ -25,11 +24,14 @@ import uuid
 import xml.etree.ElementTree as ET
 
 import garmin_backup_target as backup_target
+import garmin_platform
 
 VERSION = "1.5.0"
 DESTINATION = None  # No cloud destination exists until explicitly account/folder-bound.
 ARCHIVE_BASE = None
 IS_DARWIN = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
+HOST_PATHS = garmin_platform.user_paths()
 SOURCE_ROOT = Path(__file__).resolve().parent
 INSTALLED_ROOT = Path.home() / ".local/bin/garmin-sync"
 
@@ -59,16 +61,15 @@ MTP_CONNECT = resolve_executable(
 IOREG = "/usr/sbin/ioreg"
 GARMIN_USB_VENDOR_ID = 0x091E
 MACOS_LAUNCHD_LABEL = "com.dave0875.garmin-sync"
-RUNTIME = (Path.home() / "Library/Caches/garmin-sync" if IS_DARWIN
-           else Path(f"/run/user/{os.getuid()}/garmin-sync"))
-STATE_PATH = Path.home() / ".local/state/garmin-sync/state.json"
+RUNTIME = HOST_PATHS["runtime"]
+STATE_PATH = HOST_PATHS["state"]
 INSPECTOR = (INSTALLED_ROOT.parent / "garmin_fit_inspect.py"
              if (INSTALLED_ROOT.parent / "garmin_fit_inspect.py").is_file()
              else SOURCE_ROOT / "garmin_fit_inspect.py")
 SDK_PYTHON = (INSTALLED_ROOT / "venv/bin/python3"
               if (INSTALLED_ROOT / "venv/bin/python3").is_file()
               else Path(sys.executable))
-DEVICE_PIN_PATH = Path.home() / ".config/garmin-sync/device.json"
+DEVICE_PIN_PATH = HOST_PATHS["device"]
 BUILD_PATH = INSTALLED_ROOT / "build.json"
 EXCLUDED_EXTENSIONS = (
     "img|gma|unl|gcd|rgn|mp3|m4a|wav|aac|flac|ogg|wma|mp4|m4v|"
@@ -295,11 +296,11 @@ class RunLocks:
         private_dir(self.paths[0].parent)
         try:
             for path in self.paths:
-                fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o600)
+                fd = os.open(path, os.O_CREAT | os.O_RDWR | getattr(os, "O_CLOEXEC", 0), 0o600)
                 handle = os.fdopen(fd, "r+")
                 self.handles.append(handle)
                 try:
-                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    garmin_platform.try_lock(handle)
                 except BlockingIOError as exc:
                     raise Busy("Another Garmin copy process holds " + str(path)) from exc
             return self
@@ -354,11 +355,17 @@ def native_mount_paths(mounts):
 
 
 def discover(mount_paths=(), uid=None, username=None, expected_identity=None):
-    uid = os.getuid() if uid is None else uid
+    uid = (os.getuid() if hasattr(os, "getuid") else 0) if uid is None else uid
     username = getpass.getuser() if username is None else username
     bases = list(dict.fromkeys(Path(path) for path in mount_paths))
-    for parent in (Path(f"/run/user/{uid}/gvfs"), Path("/media") / username,
-                   Path("/run/media") / username):
+    if IS_WINDOWS:
+        # Windows file-system volumes are supported for read-only discovery.
+        # USB MTP/WPD-only watches require a separate native Windows adapter.
+        bases.extend(Path(value) for value in garmin_platform.windows_garmin_mounts(
+            garmin_platform.windows_volume_infos()) if Path(value) not in bases)
+    for parent in (() if IS_WINDOWS else
+                   (Path(f"/run/user/{uid}/gvfs"), Path("/media") / username,
+                    Path("/run/media") / username)):
         try:
             for path in sorted(parent.iterdir()):
                 if garmin_hint(path.name) and path not in bases:
@@ -618,7 +625,7 @@ class Runner:
         proc = self.process
         if proc and proc.poll() is None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, signal.SIGTERM)
+                (proc.terminate() if IS_WINDOWS else os.killpg(proc.pid, signal.SIGTERM))
 
     def run(self, args, stderr_path, timeout=1230, accepted_returncodes=(0,)):
         if self.cancellation.is_set():
@@ -627,7 +634,7 @@ class Runner:
             clean_env = (backup_target.clean_rclone_environment()
                          if Path(args[0]).name == Path(RCLONE).name else None)
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=stderr,
-                                    start_new_session=True, env=clean_env)
+                                    start_new_session=not IS_WINDOWS, env=clean_env)
             with self.lock:
                 self.process = proc
             start = time.monotonic()
@@ -637,11 +644,11 @@ class Runner:
                     if self.cancellation.is_set() or time.monotonic() - start > timeout:
                         if terminated is None:
                             with contextlib.suppress(ProcessLookupError):
-                                os.killpg(proc.pid, signal.SIGTERM)
+                                (proc.terminate() if IS_WINDOWS else os.killpg(proc.pid, signal.SIGTERM))
                             terminated = time.monotonic()
                         elif time.monotonic() - terminated > 3:
                             with contextlib.suppress(ProcessLookupError):
-                                os.killpg(proc.pid, signal.SIGKILL)
+                                (proc.kill() if IS_WINDOWS else os.killpg(proc.pid, signal.SIGKILL))
                     try:
                         stdout, _ = proc.communicate(timeout=0.2)
                         break
@@ -1187,6 +1194,8 @@ def once(state, mode):
             signal.signal(sig, handler)
 
 def service_snapshot():
+    if IS_WINDOWS:
+        return {"ActiveState": "unsupported", "reason": "Windows scheduled task adapter is not installed"}
     service = subprocess.run(["/usr/bin/systemctl", "--user", "show", "garmin-sync.service",
                               "--property=ActiveState,SubState,MainPID,Result"],
                              capture_output=True, text=True)
@@ -1232,7 +1241,7 @@ def conflicting_autostarts(directory=None):
 
 def doctor():
     checks = {}
-    checks["platform"] = "darwin" if IS_DARWIN else "linux"
+    checks["platform"] = "windows" if IS_WINDOWS else ("darwin" if IS_DARWIN else "linux")
     checks["rclone_binary"] = Path(RCLONE).is_file()
     checks["gdrive_configured"] = False
     checks["gdrive_available"] = False
@@ -1258,7 +1267,13 @@ def doctor():
         except (backup_target.BindingError, OSError, subprocess.TimeoutExpired) as exc:
             checks["gdrive_error"] = str(exc)
 
-    if IS_DARWIN:
+    if IS_WINDOWS:
+        checks["windows_wpd_mtp"] = False  # Required for full release qualification (#45).
+        checks["windows_transport"] = "drive-letter volumes only; WPD/MTP not yet implemented"
+        checks["gio"] = "not_required"
+        checks["build_metadata"] = "not_required"
+        checks["legacy_autostart_retired"] = True
+    elif IS_DARWIN:
         checks["mtp_tools"] = all(
             Path(tool).is_file() for tool in (MTP_FILETREE, MTP_FILES, MTP_CONNECT))
         checks["gio"] = "not_required"
@@ -1284,7 +1299,9 @@ def doctor():
 
     required = ["rclone_binary", "gdrive_configured", "gdrive_available",
                 "destination_identity_verified", "fit_sdk", "inspector", "enrolled_device"]
-    if IS_DARWIN:
+    if IS_WINDOWS:
+        required.append("windows_wpd_mtp")
+    elif IS_DARWIN:
         required.append("mtp_tools")
     else:
         required.extend(["gio", "build_metadata", "legacy_autostart_retired"])
@@ -1552,6 +1569,14 @@ def main(argv=None):
             log("binding_refused", error=str(exc))
             return 1
     if args.command == "status":
+        if IS_WINDOWS:
+            payload = {"platform": "windows", "state": State().snapshot(),
+                       "enrollment": enrolled_device(),
+                       "destination_binding": configured_target_status(),
+                       "healthy": False,
+                       "reason": "WPD/MTP and Windows credential storage qualification pending (#45)"}
+            print(json.dumps(payload, indent=2))
+            return 1
         if IS_DARWIN:
             payload = {
                 "platform": "darwin",
@@ -1584,6 +1609,10 @@ def main(argv=None):
         print(json.dumps(payload, indent=2))
         return 0 if healthy else 1
     if args.command == "readiness":
+        if IS_WINDOWS:
+            print(json.dumps({"ready": False, "platform": "windows",
+                              "reason": "Windows scheduler and WPD/MTP adapter not qualified"}, indent=2))
+            return 1
         if IS_DARWIN:
             print(json.dumps({"ready": False, "platform": "darwin",
                               "reason": "macOS uses manual libmtp runs, not systemd readiness"}, indent=2))
@@ -1598,7 +1627,7 @@ def main(argv=None):
     if args.command == "watch":
         return macos_watch(State())
     if args.command in ("force", "dry-run"):
-        if IS_DARWIN:
+        if IS_DARWIN or IS_WINDOWS:
             try:
                 with RunLocks():
                     return once(State(), "copy" if args.command == "force" else "dry-run")
@@ -1612,6 +1641,9 @@ def main(argv=None):
     try:
         with RunLocks():
             if args.command == "daemon":
+                if IS_WINDOWS:
+                    print("Windows Task Scheduler adapter not yet available (#45).", file=sys.stderr)
+                    return 64
                 if IS_DARWIN:
                     print("Use the macOS 'watch' command under launchd instead of daemon.",
                           file=sys.stderr)
