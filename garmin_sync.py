@@ -1494,6 +1494,8 @@ def main(argv=None):
         default=str(SOURCE_ROOT / "config" / "google-publisher.json"))
     onboard.add_argument("--rclone-config",
         default=str(Path.home() / ".config/garmin-sync/rclone.conf"))
+    onboard.add_argument("--choose-folder", action="store_true",
+        help="Choose any writable Drive parent folder through Google Picker")
     args = parser.parse_args(argv)
     if args.command == "setup-google":
         # Lazy import: normal device sync never depends on the onboarding UI.
@@ -1502,7 +1504,8 @@ def main(argv=None):
             result = setup_default(
                 publisher_path=args.publisher_metadata,
                 rclone_binary=RCLONE,
-                rclone_config=Path(args.rclone_config).expanduser().absolute())
+                rclone_config=Path(args.rclone_config).expanduser().absolute(),
+                choose_folder=args.choose_folder)
             print(json.dumps(result, indent=2))
             return 0
         except (SetupError, backup_target.BindingError, OSError, ValueError) as exc:
