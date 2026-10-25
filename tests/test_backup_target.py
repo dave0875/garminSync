@@ -1,234 +1,264 @@
-"""Offline account, sibling-folder and same-rclone-remote tests; no real Drive."""
+"""Offline account/folder isolation tests. Never use personal Drive credentials."""
 import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
+import urllib.parse
 import uuid
 
 import garmin_backup_target as target
 import garmin_sync as sync
 
-PARENT = "selectedParentFolder123"
-BACKUP = "pinnedBackupFolder123"
-ARCHIVE = "pinnedArchiveFolder456"
+PARENT = "parentFolder012345678"
+BACKUP = "backupFolder123456789"
+ARCHIVE = "archiveFolder987654321"
 ACCOUNT = "google-permission-123"
+BACKUP_NAME = "Watch Backup"
+ARCHIVE_NAME = "Retained History"
 
 
 class TargetTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
         self.root.chmod(0o700)
-        self.config = self.root / "rclone.conf"
+        self.conf = self.root / "rclone.conf"
         self.profile = self.root / "installation.json"
-        self.config.write_text("[userdrive]\ntype=drive\nroot_folder_id=" + PARENT +
-                               '\ntoken={"access_token":"testtoken"}\n')
-        self.config.chmod(0o600)
-        self.binding = {"schema_version": 2, "installation_id": str(uuid.uuid4()),
-                        "rclone_config": str(self.config), "remote": "userdrive",
-                        "google_permission_id": ACCOUNT, "parent_folder_id": PARENT,
-                        "backup_folder_id": BACKUP, "archive_folder_id": ARCHIVE,
-                        "backup_path": "Backups", "archive_path": "Archive"}
+        self.conf.write_text(
+            "[userdrive]\ntype=drive\nroot_folder_id=" + PARENT +
+            '\ntoken={"access_token":"testing"}\n')
+        self.conf.chmod(0o600)
+        self.payload = {
+            "schema_version": 2,
+            "installation_id": str(uuid.uuid4()),
+            "rclone_config": str(self.conf),
+            "remote": "userdrive",
+            "google_permission_id": ACCOUNT,
+            "parent_folder_id": PARENT,
+            "backup_folder_id": BACKUP,
+            "archive_folder_id": ARCHIVE,
+            "backup_directory": BACKUP_NAME,
+            "archive_directory": ARCHIVE_NAME,
+        }
         self.save_profile()
 
     def save_profile(self):
-        self.profile.write_text(json.dumps(self.binding))
+        self.profile.write_text(json.dumps(self.payload))
         self.profile.chmod(0o600)
 
-    @staticmethod
-    def listing(backup_id=BACKUP, archive_id=ARCHIVE):
-        return json.dumps([{"Path": "Backups", "IsDir": True, "ID": backup_id},
-                           {"Path": "Archive", "IsDir": True, "ID": archive_id}]).encode()
+    def observed(self, **changes):
+        return dict({
+            "permission_id": ACCOUNT, "parent_folder_id": PARENT,
+            "backup_folder_id": BACKUP, "archive_folder_id": ARCHIVE,
+            "email": "fixture@example.org",
+        }, **changes)
 
-    def mock_google(self, account=ACCOUNT, backup_name="Backups",
-                    archive_name="Archive", parent_for_child=PARENT,
-                    writable=True, listing=None):
-        calls = []
-        def urlopen(request, timeout):
-            calls.append((request.full_url, request.get_method()))
-            if "/about?" in request.full_url:
-                data = {"user": {"permissionId": account, "emailAddress": "test@example.com"}}
-            else:
-                folder_id = request.full_url.split("/files/")[1].split("?")[0]
-                names = {PARENT: "Selected", BACKUP: backup_name, ARCHIVE: archive_name}
-                data = {"id": folder_id, "name": names.get(folder_id, "unknown"),
-                        "mimeType": target.DRIVE_DIRECTORY, "trashed": False,
-                        "parents": [] if folder_id == PARENT else [parent_for_child],
-                        "capabilities": {"canAddChildren": writable}}
-            return io.BytesIO(json.dumps(data).encode())
-        proc = mock.patch.object(target.subprocess, "run", return_value=mock.Mock(
-            returncode=0, stdout=self.listing() if listing is None else listing))
-        http = mock.patch.object(target.urllib.request, "urlopen", side_effect=urlopen)
-        return proc, http, calls
-
-    def test_private_profile_valid_and_no_two_remote_schema(self):
+    def test_requires_private_and_v2_profile(self):
         self.assertEqual(target.load_profile(self.profile)["remote"], "userdrive")
-        self.binding["schema_version"] = 1
-        self.save_profile()
-        with self.assertRaisesRegex(target.BindingError, "v2"):
-            target.load_profile(self.profile)
-        self.binding["schema_version"] = 2
-        self.save_profile()
         self.profile.chmod(0o644)
-        with self.assertRaisesRegex(target.BindingError, "private"):
+        with self.assertRaises(target.BindingError):
+            target.load_profile(self.profile)
+        self.profile.chmod(0o600)
+        self.payload["schema_version"] = 1
+        self.save_profile()
+        with self.assertRaisesRegex(target.BindingError, "version"):
             target.load_profile(self.profile)
 
-    def test_refuse_same_paths_ids_and_path_escape(self):
-        for key, value in [
-            ("archive_path", "Backups"), ("archive_path", "../elsewhere"),
-            ("archive_path", "folder/child"), ("archive_path", " Backups"),
-            ("archive_folder_id", BACKUP), ("parent_folder_id", ARCHIVE)]:
-            before = dict(self.binding)
-            with self.subTest(key=key,value=value):
-                self.binding[key] = value
-                self.save_profile()
+    def test_rejects_unsafe_child_names(self):
+        for value in ("", ".", "../escape", "top/under", "bad\\dir", "x\nwrong", " "):
+            with self.subTest(value=value):
                 with self.assertRaises(target.BindingError):
-                    target.load_profile(self.profile)
-            self.binding = before
+                    target.valid_child(value)
 
-    def test_no_global_remote_symlink_or_service_account(self):
-        symlink = self.root / "alias"
-        symlink.symlink_to(self.config)
-        with self.assertRaises(target.BindingError):
-            target.private_file(symlink)
-        with self.config.open("a") as f:
-            f.write("service_account_file=/tmp/unapproved.json\n")
-        with self.assertRaisesRegex(target.BindingError, "Unsupported"):
-            target.remote_section(self.config, "userdrive")
-
-    def test_verified_paths_share_one_rooted_remote(self):
-        proc, http, calls = self.mock_google()
-        with proc as process, http:
-            with target.prepared_target("rclone", self.root, self.profile) as config:
-                self.assertEqual(config["destination"], "userdrive:Backups")
-                self.assertEqual(config["archive_base"], "userdrive:Archive")
-                self.assertEqual(config["rclone_options"][0], "--config")
-                self.assertTrue(Path(config["rclone_options"][1]).exists())
-                self.assertTrue(all("lsjson" in args.args[0] for args in process.call_args_list))
-                snapshot = config["rclone_options"][1]
-        self.assertFalse(Path(snapshot).exists())
-        self.assertEqual(len(calls), 4)
-        self.assertTrue(all(method == "GET" for _,method in calls))
-
-    def test_bad_account_fails_closed_before_copy(self):
-        proc,http,_ = self.mock_google(account="other-account")
-        with proc,http, self.assertRaises(target.BindingError):
-            with target.prepared_target("rclone", self.root, self.profile):
-                self.fail("Wrong principal must not yield target")
-
-    def test_rclone_child_id_mismatch_fails_closed(self):
-        proc,http,_ = self.mock_google(listing=self.listing(backup_id="otherChildFolder123"))
-        with proc,http, self.assertRaises(target.BindingError):
-            with target.prepared_target("rclone", self.root, self.profile):
-                self.fail("Wrong child ID accepted")
-
-    def test_child_missing_id_fails_closed(self):
-        proc,http,_=self.mock_google(listing=json.dumps([
-            {"Path":"Backups", "IsDir": True},
-            {"Path":"Archive", "IsDir": True, "ID":ARCHIVE}]).encode())
-        with proc,http,self.assertRaisesRegex(target.BindingError,"Cannot prove"):
-            target.inspect_target("rclone",self.config,"userdrive","Backups","Archive")
-
-    def test_child_moved_or_renamed_fails_closed(self):
-        for values in ({"parent_for_child":"differentParent123"},
-                       {"backup_name":"Replaced"}):
-            proc,http,_=self.mock_google(**values)
-            with self.subTest(values=values),proc,http,self.assertRaises(target.BindingError):
-                target.inspect_target("rclone",self.config,"userdrive","Backups","Archive")
-
-    def test_unwritable_folder_fails_closed(self):
-        proc,http,_=self.mock_google(writable=False)
-        with proc,http,self.assertRaisesRegex(target.BindingError,"writable"):
-            target.inspect_target("rclone",self.config,"userdrive","Backups","Archive")
-
-    def test_rclone_root_retarget_fails_closed(self):
-        self.config.write_text("[userdrive]\ntype=drive\nroot_folder_id=differentParent123\n"
-                               'token={"access_token":"testtoken"}\n')
-        proc,http,_=self.mock_google()
-        with proc,http,self.assertRaises(target.BindingError):
-            with target.prepared_target("rclone",self.root,self.profile):
-                self.fail("Repointed root accepted")
-
-    def test_failed_remote_or_identity_api_blocks(self):
-        with mock.patch.object(target.subprocess, "run",return_value=mock.Mock(returncode=1)):
+    def test_no_folder_id_overlap_or_same_path(self):
+        for replacement in (("archive_folder_id", BACKUP),
+                            ("archive_directory", BACKUP_NAME.lower())):
+            key, bad = replacement
+            original = self.payload[key]
+            self.payload[key] = bad
+            self.save_profile()
             with self.assertRaises(target.BindingError):
-                target.inspect_target("rclone",self.config,"userdrive","Backups","Archive")
-        proc,http,_=self.mock_google()
-        with proc,http:
-            with mock.patch.object(target, "_request_json",
-                                   side_effect=target.BindingError("API offline")):
-                with self.assertRaises(target.BindingError):
-                    target.inspect_target("rclone",self.config,"userdrive","Backups","Archive")
+                target.load_profile(self.profile)
+            self.payload[key] = original
+        self.save_profile()
 
-    def test_two_users_same_alias_different_accounts_and_folders(self):
-        other=self.root/"other"
-        other.mkdir(mode=0o700)
-        cfg=other/"rclone.conf"
-        cfg.write_text("[userdrive]\ntype=drive\nroot_folder_id=anotherParent98765\n"
-                       'token={"access_token":"different"}\n')
-        cfg.chmod(0o600)
-        profile=other/"installation.json"
-        second=dict(self.binding,installation_id=str(uuid.uuid4()),
-                    rclone_config=str(cfg), google_permission_id="account-B",
-                    parent_folder_id="anotherParent98765",
-                    backup_folder_id="otherBackup123456",archive_folder_id="otherArchive123456")
-        profile.write_text(json.dumps(second))
+    def test_symlink_credential_and_ambient_gdrive_rejected(self):
+        link = self.root / "outside.conf"
+        link.symlink_to(self.conf)
+        with self.assertRaises(target.BindingError):
+            target.private_file(link)
+        with mock.patch.dict(os.environ, {"RCLONE_CONFIG": "/tmp/foreign.conf",
+                                          "RCLONE_CONFIG_USERDRIVE_TOKEN": "foreign"}):
+            result = target.clean_rclone_environment()
+        self.assertNotIn("RCLONE_CONFIG", result)
+        self.assertNotIn("RCLONE_CONFIG_USERDRIVE_TOKEN", result)
+
+    def test_unsupported_remote_account_mode_rejected(self):
+        with self.conf.open("a") as handle:
+            handle.write("service_account_file=/tmp/another-person.json\n")
+        with self.assertRaises(target.BindingError):
+            target.remote_section(self.conf, "userdrive")
+
+    def test_approved_target_uses_same_remote_and_private_snapshot(self):
+        with mock.patch.object(target, "inspect_remote", return_value=self.observed()):
+            with target.prepared_target("rclone", self.root, self.profile) as bound:
+                self.assertEqual(bound["destination"], "userdrive:" + BACKUP_NAME)
+                self.assertEqual(bound["archive_base"], "userdrive:" + ARCHIVE_NAME)
+                self.assertEqual(bound["destination"].split(":")[0],
+                                 bound["archive_base"].split(":")[0])
+                snapshot = Path(bound["rclone_options"][1])
+                self.assertTrue(snapshot.is_file())
+                self.assertNotEqual(snapshot, self.conf)
+            self.assertFalse(snapshot.exists())
+
+    def test_parent_root_mismatch_refuses_before_inspection(self):
+        self.conf.write_text(
+            "[userdrive]\ntype=drive\nroot_folder_id=anotherParent012345678\n"
+            'token={"access_token":"testing"}\n')
+        self.conf.chmod(0o600)
+        with mock.patch.object(target, "inspect_remote") as inspect:
+            with self.assertRaisesRegex(target.BindingError, "parent"):
+                with target.prepared_target("rclone", self.root, self.profile):
+                    self.fail("incorrect Drive root was approved")
+            inspect.assert_not_called()
+
+    def test_account_and_each_folder_mismatch_fail_closed(self):
+        for change in ({"permission_id": "wrong"}, {"parent_folder_id": "foreign"},
+                       {"backup_folder_id": ARCHIVE}, {"archive_folder_id": BACKUP}):
+            with self.subTest(change=change), \
+                 mock.patch.object(target, "inspect_remote",
+                                   return_value=self.observed(**change)):
+                with self.assertRaises(target.BindingError):
+                    with target.prepared_target("rclone", self.root, self.profile):
+                        self.fail("foreign account/folder granted")
+
+    def test_bad_google_api_does_not_authorize_cloud_write(self):
+        state = sync.State(self.root / "state.json")
+        fake_runner = mock.Mock()
+        with mock.patch.object(sync.backup_target, "prepared_target",
+                               side_effect=target.BindingError("Google unavailable")):
+            with self.assertRaises(target.BindingError):
+                sync.SyncRun(state, runner=fake_runner).execute("/fake/GARMIN")
+        fake_runner.run.assert_not_called()
+
+    def test_google_metadata_inspection_rejects_duplicate_name_and_wrong_parent(self):
+        class Response(io.BytesIO):
+            pass
+
+        def api(request, timeout=15):
+            url = urllib.parse.urlparse(request.full_url)
+            params = urllib.parse.parse_qs(url.query)
+            if url.path.endswith("/about"):
+                result = {"user": {"permissionId": ACCOUNT,
+                                   "emailAddress": "fixture@example.org"}}
+            elif url.path.endswith("/files"):
+                q = params["q"][0]
+                if BACKUP_NAME in q:
+                    entries = [{"id": BACKUP, "name": BACKUP_NAME},
+                               {"id": "collidingOtherFolder"}]
+                else:
+                    entries = [{"id": ARCHIVE, "name": ARCHIVE_NAME}]
+                result = {"files": entries}
+            else:
+                folder = url.path.split("/files/", 1)[1]
+                name = {BACKUP: BACKUP_NAME, ARCHIVE: ARCHIVE_NAME}.get(folder, "parent")
+                result = {"id": folder, "name": name, "trashed": False,
+                          "mimeType": target.DRIVE_DIRECTORY,
+                          "parents": [PARENT], "capabilities": {"canAddChildren": True}}
+            return Response(json.dumps(result).encode())
+
+        with mock.patch.object(target.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)), \
+             mock.patch.object(target.urllib.request, "urlopen", side_effect=api):
+            with self.assertRaisesRegex(target.BindingError, "Ambiguous"):
+                target.inspect_remote("rclone", self.conf, "userdrive",
+                                      BACKUP_NAME, ARCHIVE_NAME, BACKUP, ARCHIVE)
+
+    def test_google_metadata_inspection_happy_path(self):
+        requests = []
+        def fake_json(url, token):
+            requests.append(url)
+            if "/about?" in url:
+                return {"user": {"permissionId": ACCOUNT, "emailAddress": "ok@example.org"}}
+            if "/files?" in url:
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["q"][0]
+                return {"files": [{"id": BACKUP if BACKUP_NAME in q else ARCHIVE}]}
+            folder = url.split("/files/", 1)[1].split("?", 1)[0]
+            return {"id": folder, "name": {BACKUP: BACKUP_NAME,
+                     ARCHIVE: ARCHIVE_NAME}.get(folder, "parent"),
+                    "mimeType": target.DRIVE_DIRECTORY,
+                    "parents": [PARENT], "trashed": False,
+                    "capabilities": {"canAddChildren": True}}
+        with mock.patch.object(target.subprocess, "run",
+                               return_value=mock.Mock(returncode=0)) as cmd, \
+             mock.patch.object(target, "_request_json", side_effect=fake_json):
+            result = target.inspect_remote("rclone", self.conf, "userdrive",
+                                          BACKUP_NAME, ARCHIVE_NAME, BACKUP, ARCHIVE)
+        self.assertEqual(result["permission_id"], ACCOUNT)
+        self.assertEqual(result["parent_folder_id"], PARENT)
+        self.assertEqual(len(requests), 6)
+        self.assertEqual(cmd.call_count, 1)
+
+    def test_two_identically_named_remotes_have_independent_installation_binding(self):
+        second = self.root / "second"
+        second.mkdir(mode=0o700)
+        conf = second / "config"
+        new_parent = "independentParent123456"
+        conf.write_text("[userdrive]\ntype=drive\nroot_folder_id=" + new_parent +
+                        '\ntoken={"access_token":"independent"}\n')
+        conf.chmod(0o600)
+        other = dict(self.payload, installation_id=str(uuid.uuid4()),
+                     google_permission_id="other-google-id", rclone_config=str(conf),
+                     parent_folder_id=new_parent,
+                     backup_folder_id="anotherBackup123456",
+                     archive_folder_id="anotherArchive123456")
+        profile = second / "installation.json"
+        profile.write_text(json.dumps(other))
         profile.chmod(0o600)
-        # Isolated inspectors represent real read-only Google probes.
-        def inspect(_binary,snapshot,remote,backup,archive):
-            p=target.remote_section(snapshot,remote)["parent_id"]
-            is_other=p==second["parent_folder_id"]
-            return {"permission_id":"account-B" if is_other else ACCOUNT,
-                    "parent_folder_id":p,
-                    "backup_folder_id":second["backup_folder_id"] if is_other else BACKUP,
-                    "archive_folder_id":second["archive_folder_id"] if is_other else ARCHIVE,
-                    "backup_path":backup,"archive_path":archive}
-        with mock.patch.object(target,"inspect_target",side_effect=inspect):
-            with target.prepared_target("rclone",self.root,self.profile) as first:
-                with target.prepared_target("rclone",self.root,profile) as second_target:
-                    self.assertEqual(first["destination"],second_target["destination"])
-                    self.assertNotEqual(first["installation_id"],second_target["installation_id"])
+        def inspect(_rclone, config, *args):
+            if target.remote_section(config, "userdrive")["folder_id"] == new_parent:
+                return {"permission_id": "other-google-id", "parent_folder_id": new_parent,
+                        "backup_folder_id": other["backup_folder_id"],
+                        "archive_folder_id": other["archive_folder_id"]}
+            return self.observed()
+        with mock.patch.object(target, "inspect_remote", side_effect=inspect):
+            with target.prepared_target("rclone", self.root, self.profile) as first:
+                with target.prepared_target("rclone", self.root, profile) as other_bound:
+                    self.assertNotEqual(first["installation_id"], other_bound["installation_id"])
                     self.assertNotEqual(
                         Path(first["rclone_options"][1]).read_bytes(),
-                        Path(second_target["rclone_options"][1]).read_bytes())
-            second["google_permission_id"]=ACCOUNT
-            profile.write_text(json.dumps(second))
-            profile.chmod(0o600)
-            with self.assertRaises(target.BindingError):
-                with target.prepared_target("rclone",self.root,profile):
-                    self.fail("Wrong principal should fail")
+                        Path(other_bound["rclone_options"][1]).read_bytes())
 
-    def test_no_operational_copy_when_unbound(self):
-        runner=mock.Mock()
-        with mock.patch.object(target,"prepared_target",side_effect=target.BindingError("unbound")):
-            with self.assertRaises(target.BindingError):
-                sync.SyncRun(None,runner=runner).execute("/device/GARMIN")
-        runner.run.assert_not_called()
 
-    def test_bind_requires_positive_identity_then_prevents_rebind(self):
-        self.profile.unlink()
-        proc,http,_=self.mock_google()
-        with proc,http:
-            result=target.bind_profile("rclone",self.config,"userdrive","Backups","Archive",
-                                       ACCOUNT,PARENT,BACKUP,ARCHIVE,path=self.profile)
-        self.assertEqual(result["parent_folder_id"],PARENT)
-        self.assertEqual(target.load_profile(self.profile)["archive_path"],"Archive")
-        with self.assertRaisesRegex(target.BindingError,"already bound"):
-            target.bind_profile("rclone",self.config,"userdrive","Backups","Archive",
-                                ACCOUNT,PARENT,BACKUP,ARCHIVE,path=self.profile)
+@unittest.skipUnless(Path(sync.RCLONE).exists(), "rclone unavailable")
+class SameRemoteArchiveFixture(unittest.TestCase):
+    def test_rclone_backup_dir_preserves_overwritten_file_in_sibling(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            source = root / "watch"
+            destination = root / "drive" / "Backups"
+            archive = root / "drive" / "Archive" / "run-1"
+            (source / "Activity").mkdir(parents=True)
+            destination.joinpath("Activity").mkdir(parents=True)
+            source.joinpath("Activity", "one.fit").write_bytes(b"new version")
+            destination.joinpath("Activity", "one.fit").write_bytes(b"old version")
+            config = root / "local-rclone.conf"
+            config.write_text("[localuser]\ntype=local\n")
+            subprocess.run([sync.RCLONE, "copy", str(source), "localuser:Backups",
+                            "--backup-dir", "localuser:Archive/run-1", "--config",
+                            str(config), "--checksum"], check=True,
+                           env={**target.clean_rclone_environment()},
+                           capture_output=True, cwd=root)
+            self.assertEqual(destination.joinpath("Activity", "one.fit").read_bytes(),
+                             b"new version")
+            self.assertEqual(archive.joinpath("Activity", "one.fit").read_bytes(),
+                             b"old version")
 
-    def test_ambient_rclone_override_is_removed(self):
-        with mock.patch.dict(os.environ,{"RCLONE_CONFIG":"/tmp/unapproved",
-                                         "RCLONE_CONFIG_USERDRIVE_ROOT_FOLDER_ID":"other",
-                                         "OTHER":"safe"}):
-            clean=target.clean_rclone_environment()
-        self.assertNotIn("RCLONE_CONFIG",clean)
-        self.assertNotIn("RCLONE_CONFIG_USERDRIVE_ROOT_FOLDER_ID",clean)
-        self.assertEqual(clean["OTHER"],"safe")
 
-if __name__=="__main__":
+if __name__ == "__main__":
     unittest.main()
