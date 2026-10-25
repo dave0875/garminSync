@@ -8,9 +8,11 @@ import time
 import webbrowser
 
 import garmin_google_oauth as oauth
+import garmin_google_picker as picker
 
 
-def authorize_with_browser(client_id, *, timeout_seconds=180, open_browser=True):
+def authorize_with_browser(client_id, *, timeout_seconds=180, open_browser=True,
+                           choose_folder=False):
     """Return an OAuth response to a *local* caller, never to the browser page.
 
     The returned payload contains secrets. Caller must immediately hand it to
@@ -23,7 +25,8 @@ def authorize_with_browser(client_id, *, timeout_seconds=180, open_browser=True)
     server = HTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
     try:
         port = server.server_address[1]
-        attempt = oauth.new_authorization(client_id, port)
+        attempt = (picker.folder_picker_attempt(client_id, port) if choose_folder
+                   else oauth.new_authorization(client_id, port))
         received = []
         class Callback(BaseHTTPRequestHandler):
             def do_GET(self):
@@ -35,11 +38,12 @@ def authorize_with_browser(client_id, *, timeout_seconds=180, open_browser=True)
                     self.send_error(409, "Authorization already completed")
                     return
                 try:
-                    code = oauth.consume_callback(attempt, self.path)
+                    grant = (picker.consume_folder_picker_callback(attempt, self.path)
+                             if choose_folder else (oauth.consume_callback(attempt, self.path), None))
                 except oauth.OAuthError:
                     self.send_error(400, "Google authorization could not be accepted")
                     return
-                received.append(code)
+                received.append(grant)
                 self.send_response(200)
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -60,6 +64,8 @@ def authorize_with_browser(client_id, *, timeout_seconds=180, open_browser=True)
         if not received:
             raise oauth.OAuthError("Google authorization timed out")
         # Code exchange runs only after the authorization state is checked.
-        return oauth.exchange_code(attempt, received.pop())
+        code, folder_id = received.pop()
+        token = oauth.exchange_code(attempt, code)
+        return (token, folder_id) if choose_folder else token
     finally:
         server.server_close()
