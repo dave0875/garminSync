@@ -6,6 +6,7 @@ and secure credential store still need release qualification (#39-#43).
 """
 import json
 from pathlib import Path
+import sys
 
 import garmin_backup_target as target
 import garmin_drive_provision as drive
@@ -53,6 +54,10 @@ def setup_default(*, publisher_path, rclone_binary, rclone_config,
     Never substitute ambient Google credentials, replace an existing profile,
     or create folders until user has explicitly confirmed this operation.
     """
+    if sys.platform == "win32":
+        # Prevent orphaned cloud folders/tokens until Windows DPAPI/DACL +
+        # WPD/MTP acquisition have passed the release gate in issue #45.
+        raise SetupError("Windows secure credential/device onboarding is not yet qualified (#45)")
     if Path(profile_path).exists() or Path(profile_path).is_symlink():
         raise SetupError("Already configured; existing installation requires explicit rebind")
     if Path(rclone_config).exists() or Path(rclone_config).is_symlink():
