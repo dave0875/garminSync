@@ -36,7 +36,7 @@ jobs:
       - name: Static checks
         run: |
           set -euo pipefail
-          python -m py_compile garmin_sync.py garmin_backup_target.py garmin_google_oauth.py garmin_google_browser.py garmin_drive_provision.py garmin_setup_google.py garmin_fit_inspect.py tests/test_sync.py tests/test_backup_target.py tests/test_google_oauth.py tests/test_google_browser.py tests/test_drive_provision.py tests/test_setup_google.py
+          python -m py_compile garmin_sync.py garmin_backup_target.py garmin_google_oauth.py garmin_google_picker.py garmin_google_browser.py garmin_drive_provision.py garmin_setup_google.py garmin_fit_inspect.py tests/test_sync.py tests/test_backup_target.py tests/test_google_oauth.py tests/test_google_picker.py tests/test_google_browser.py tests/test_drive_provision.py tests/test_setup_google.py
           bash -n bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh scripts/install-macos-launchagent.sh
           shellcheck bin/garmin-syncctl bin/garmin_autodev_sync.sh scripts/deploy-gorf.sh scripts/install-macos-launchagent.sh
           command -v rg >/dev/null
