@@ -1,4 +1,4 @@
-> **DESIGN-IN-PROGRESS / NOT FOR PRODUCTION.** The current CLI/manual rclone steps are transitional. Consumer onboarding is specified in [ADR-0001](docs/ADR-0001-consumer-onboarding-google-oauth.md) (#39-#43); draft PR #37 must also fix the rclone archive same-remote incompatibility (#38) before use.
+> **DESIGN-IN-PROGRESS / NOT FOR PRODUCTION.** A suggested Google Drive default and optional Picker change are implemented in the experimental CLI (#44). Onboarding still needs a published Google OAuth client, a user-friendly UI, and release qualification. Same-remote backup/archive behavior was corrected on draft PR #37 (#38), but live-account and GORF migration tests remain. Windows has import/volume/lock foundations and native CI smoke tests, **not** production-ready WPD/MTP or secure credential handling (#45). See [three-platform support and release gates](docs/PLATFORMS.md).
 
 # Garmin Sync: enrolled-device preservation to an identity-bound Google Drive
 
@@ -7,13 +7,16 @@ The device must expose `GARMIN/GarminDevice.xml` and its native files through
 a supported USB/MTP transport. Enrollment pins its SHA-256 device identity.
 This repository does not use Garmin Connect, Garth, or Garmin's cloud.
 
-**Each installation selects its own Google account and any two existing, writable
-Drive folders for backups and archives.** Names such as `Fenix8_Backup`,
-`Garmin`, or the rclone remote alias `gdrive:` are **not required**.
+**Each installation selects its own Google account and a single Google Drive
+parent location** (suggested: `My Drive / Garmin Sync`), then the app manages
+`Backups` and `Archive` siblings within that location. Names like `Fenix8_Backup`
+or the rclone alias `gdrive:` are **not required** for new users.
 No Drive mutation occurs without an explicitly approved, private installation
 profile and live checks of the approved Google principal and both folder IDs.
 
 - [Per-user installation, Drive binding and migration guide](docs/INSTALLATION.md)
+- [Linux, macOS and Windows platform matrix](docs/PLATFORMS.md)
+- [Accepted first-run default/Change feature](https://github.com/dave0875/garminSync/issues/44)
 - [GitHub CI/CD workflow](.github/workflows/ci.yml)
 
 ## Architecture
@@ -21,6 +24,7 @@ profile and live checks of the approved Google principal and both folder IDs.
 ```text
 Enrolled Garmin with GarminDevice.xml
   Linux: GVFS/GIO        macOS: read-only libmtp snapshot
+  Windows: mounted-volume prototype (WPD/MTP release blocker #45)
              \             /
               source inventory + device identity verification
                               |
