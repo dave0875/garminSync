@@ -24,7 +24,7 @@ import urllib.parse
 import uuid
 import xml.etree.ElementTree as ET
 
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 DESTINATION = "gdrive:Garmin/Fenix8_Backup"
 ARCHIVE_BASE = "gdrive:Garmin/Fenix8_Archive"
 IS_DARWIN = sys.platform == "darwin"
@@ -84,6 +84,7 @@ FILTERS = [
 ]
 FINITE = ["--retries", "3", "--low-level-retries", "5", "--timeout", "60s",
           "--contimeout", "15s"]
+LIVE_MTP_PARALLELISM = ["--checkers", "1", "--transfers", "1"]
 
 
 def now():
@@ -99,6 +100,59 @@ def private_dir(path):
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     path.chmod(0o700)
     return path
+
+
+def desktop_notification(title, message, urgency="critical"):
+    """Best-effort desktop notice; the state and journal remain authoritative."""
+    def send():
+        try:
+            if IS_DARWIN:
+                script = ('on run argv\n'
+                          'display notification (item 2 of argv) with title (item 1 of argv)\n'
+                          'end run')
+                command = ["/usr/bin/osascript", "-e", script, title, message]
+            else:
+                binary = shutil.which("notify-send")
+                if not binary:
+                    return
+                command = [binary, "--app-name=Garmin Sync", "--urgency=" + urgency,
+                           title, message]
+            subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           timeout=5, check=False)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    threading.Thread(target=send, name="garmin-notification", daemon=True).start()
+
+
+class ConnectionAlerts:
+    """Keep one actionable warning in status and deduplicate desktop notices."""
+    def __init__(self, state, notify=desktop_notification):
+        self.state = state
+        self.notify = notify
+        self.lock = threading.Lock()
+
+    def raise_alert(self, code, message, **details):
+        with self.lock:
+            current = self.state.snapshot()
+            token = current.get("connection_token")
+            previous = current.get("active_alert") or {}
+            if previous.get("code") == code and previous.get("connection_token") == token:
+                return
+            alert = {"code": code, "message": message, "since": now(),
+                     "connection_token": token, **details}
+            self.state.update(active_alert=alert)
+            log("connection_alert", **alert)
+            self.notify("Garmin backup needs attention", message)
+
+    def clear(self):
+        with self.lock:
+            previous = self.state.snapshot().get("active_alert")
+            if not previous:
+                return
+            self.state.update(active_alert=None)
+            log("connection_alert_cleared", code=previous["code"])
+            self.notify("Garmin backup verified", "The connected watch was copied and verified.",
+                        urgency="normal")
 
 
 def linux_usb_presence(sysfs_root=Path("/sys/bus/usb/devices")):
@@ -127,13 +181,17 @@ def linux_usb_presence(sysfs_root=Path("/sys/bus/usb/devices")):
 
 class UsbHealthObserver:
     """Transition-only USB and GVFS diagnostics, without privileged kernel logs."""
-    def __init__(self, state, clock=time.monotonic, grace_seconds=120):
+    def __init__(self, state, clock=time.monotonic, grace_seconds=120,
+                 transient_grace_seconds=90, alerts=None):
         self.state = state
         self.clock = clock
         self.grace_seconds = grace_seconds
+        self.transient_grace_seconds = transient_grace_seconds
+        self.alerts = alerts
         self.last = None
         self.changed_at = None
         self.warned = False
+        self.transient_warned = False
 
     def observe(self, usb_state, mtp_mounted):
         condition = (usb_state, bool(mtp_mounted))
@@ -142,15 +200,29 @@ class UsbHealthObserver:
             self.last = condition
             self.changed_at = moment
             self.warned = False
+            self.transient_warned = False
             log("usb_state_changed", usb_state=usb_state, mtp_mounted=bool(mtp_mounted))
+        if (usb_state == "garmin_transient" and not self.transient_warned and
+                moment - self.changed_at >= self.transient_grace_seconds):
+            self.transient_warned = True
+            log("usb_transient_delayed", seconds_without_mtp=int(moment - self.changed_at))
+            if self.alerts:
+                self.alerts.raise_alert(
+                    "usb_mode_delayed", "The watch is visible on USB but has not entered MTP mode. "
+                    "Check Watch Settings > System > Advanced > USB Mode and the connector.")
         if (usb_state == "fenix_mtp_interface" and not mtp_mounted and
                 not self.warned and moment - self.changed_at >= self.grace_seconds):
             self.warned = True
             log("mtp_mount_delayed", usb_state=usb_state,
                 seconds_without_mount=int(moment - self.changed_at))
+            if self.alerts:
+                self.alerts.raise_alert(
+                    "mtp_mount_delayed", "The watch entered MTP mode, but its files did not mount. "
+                    "Check the USB connection and watch USB mode.")
         self.state.update(usb_state=usb_state, usb_checked_at=now(),
                           mtp_mounted=bool(mtp_mounted),
-                          mtp_mount_delayed=self.warned)
+                          mtp_mount_delayed=self.warned,
+                          usb_transient_delayed=self.transient_warned)
 
 
 def assess_sync_health(state, enrolled=None, service_ready=None):
@@ -165,16 +237,22 @@ def assess_sync_health(state, enrolled=None, service_ready=None):
             "detected": detected, "last_error": state.get("last_error"),
             "usb_state": state.get("usb_state"), "mtp_mounted": state.get("mtp_mounted"),
             "mtp_mount_delayed": state.get("mtp_mount_delayed", False),
+            "usb_transient_delayed": state.get("usb_transient_delayed", False),
+            "active_alert": state.get("active_alert"),
             "retry_at": state.get("retry_at"),
             "verified_current_connection": bool(verified_current)}
     if enrolled is False or status == "unenrolled":
         level, reason = "degraded", "no enrolled Fenix 8; enrollment required"
     elif service_ready is False:
         level, reason = "degraded", "daemon not ready (service or process mismatch)"
+    elif state.get("active_alert"):
+        level, reason = "degraded", state["active_alert"]["message"]
     elif status in ("failed", "blocked", "retry_wait", "stopped", "stopping"):
         level, reason = "degraded", state.get("last_error") or "synchronization failed or is blocked"
     elif not detected and state.get("mtp_mount_delayed"):
         level, reason = "degraded", "Fenix USB present but MTP mount unavailable beyond grace period"
+    elif not detected and state.get("usb_transient_delayed"):
+        level, reason = "degraded", "Garmin USB interface did not enter MTP mode"
     elif not detected:
         level, reason = "waiting_for_device", "no mounted enrolled Fenix 8; previous success is historical"
     elif status in ("copy", "verifying", "dry-run"):
@@ -602,6 +680,57 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
         yield device
 
 
+class RcloneProgress:
+    """Watch completed rclone work, rather than its periodic stats messages."""
+    def __init__(self, path, on_stall, clock=time.monotonic,
+                 alert_after=180, abort_after=480):
+        self.path = Path(path)
+        self.on_stall = on_stall
+        self.clock = clock
+        self.alert_after = alert_after
+        self.abort_after = abort_after
+        self.offset = self.path.stat().st_size if self.path.exists() else 0
+        self.partial = b""
+        self.last_progress = clock()
+        self.counters = None
+        self.warned = False
+
+    def poll(self):
+        try:
+            with self.path.open("rb") as stream:
+                stream.seek(self.offset)
+                content = stream.read()
+                self.offset = stream.tell()
+        except OSError:
+            content = b""
+        if content:
+            lines = (self.partial + content).split(b"\n")
+            self.partial = lines.pop()
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                stats = entry.get("stats") if isinstance(entry, dict) else None
+                if not isinstance(stats, dict):
+                    continue
+                try:
+                    counters = tuple(int(stats.get(key) or 0)
+                                     for key in ("checks", "transfers", "bytes"))
+                except (ValueError, TypeError):
+                    continue
+                if self.counters is None or any(new > old for new, old in
+                                                zip(counters, self.counters)):
+                    self.last_progress = self.clock()
+                    self.warned = False
+                self.counters = counters
+        stalled = self.clock() - self.last_progress
+        if stalled >= self.alert_after and not self.warned:
+            self.warned = True
+            self.on_stall(int(stalled))
+        return stalled >= self.abort_after
+
+
 class Runner:
     def __init__(self, cancellation=None):
         self.cancellation = cancellation or threading.Event()
@@ -615,9 +744,15 @@ class Runner:
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(proc.pid, signal.SIGTERM)
 
-    def run(self, args, stderr_path, timeout=1230, accepted_returncodes=(0,)):
+    def run(self, args, stderr_path, timeout=1230, accepted_returncodes=(0,),
+            progress_log=None, on_stall=None, stall_alert_after=180,
+            stall_abort_after=480):
         if self.cancellation.is_set():
             raise Cancelled("Connection interrupted")
+        progress = (RcloneProgress(progress_log, on_stall,
+                                  alert_after=stall_alert_after,
+                                  abort_after=stall_abort_after)
+                    if progress_log and on_stall else None)
         with open(stderr_path, "ab") as stderr:
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=stderr,
                                     start_new_session=True)
@@ -625,10 +760,15 @@ class Runner:
                 self.process = proc
             start = time.monotonic()
             terminated = None
+            termination_reason = None
             try:
                 while True:
-                    if self.cancellation.is_set() or time.monotonic() - start > timeout:
+                    stalled = progress.poll() if progress else False
+                    if (self.cancellation.is_set() or time.monotonic() - start > timeout or
+                            stalled):
                         if terminated is None:
+                            termination_reason = ("rclone made no progress"
+                                                  if stalled else "Command exceeded finite duration")
                             with contextlib.suppress(ProcessLookupError):
                                 os.killpg(proc.pid, signal.SIGTERM)
                             terminated = time.monotonic()
@@ -643,7 +783,7 @@ class Runner:
                 if self.cancellation.is_set():
                     raise Cancelled("Connection interrupted")
                 if terminated is not None:
-                    raise CommandFailed("Command exceeded finite duration")
+                    raise CommandFailed(termination_reason)
                 if proc.returncode not in accepted_returncodes:
                     action = args[1] if len(args) > 1 else Path(args[0]).name
                     raise CommandFailed(
@@ -747,7 +887,7 @@ def mount_matches_source(mount, source):
 class SyncRun:
     def __init__(self, state, runner=None, runtime=RUNTIME, destination=DESTINATION,
                  archive_base=ARCHIVE_BASE, token=None, inspect=True,
-                 inspector=INSPECTOR, sdk_python=SDK_PYTHON):
+                 inspector=INSPECTOR, sdk_python=SDK_PYTHON, alerts=None):
         self.state = state
         self.runner = runner or Runner()
         self.runtime = runtime
@@ -757,6 +897,7 @@ class SyncRun:
         self.inspect = inspect
         self.inspector = Path(inspector)
         self.sdk_python = Path(sdk_python)
+        self.alerts = alerts
 
     def update(self, **fields):
         if self.state:
@@ -782,6 +923,20 @@ class SyncRun:
             if not original_device:
                 raise Cancelled("Device identity missing at start")
             common = FINITE + ["--use-json-log", "--log-level", "INFO", "--log-file", str(logfile)]
+            live_options = [] if source_snapshot else LIVE_MTP_PARALLELISM
+
+            def progress_options(phase):
+                if source_snapshot:
+                    return {}
+                def stalled(seconds):
+                    message = (f"Backup made no completed-file progress for {seconds} seconds "
+                               f"during {phase}. Check the watch connection and Drive.")
+                    self.update(stalled_at=now(), stalled_phase=phase)
+                    log("sync_stalled", run_id=run_id, phase=phase, seconds=seconds)
+                    if self.alerts:
+                        self.alerts.raise_alert("sync_stalled", message,
+                                                phase=phase, run_id=run_id)
+                return {"progress_log": logfile, "on_stall": stalled}
 
             def inventory():
                 result = self.runner.run([RCLONE, "lsjson", source, "-R", "--files-only",
@@ -811,7 +966,8 @@ class SyncRun:
             archive = self.archive_base.rstrip("/") + "/" + run_id
             self.update(status=mode, considered=len(before), copied=0, verified=0,
                         archive=archive if mode == "copy" else None, run_started_at=now(),
-                        selection="filters" if odd_names else "manifest", last_error=None)
+                        selection="filters" if odd_names else "manifest", last_error=None,
+                        stalled_at=None, stalled_phase=None)
             log("inventory", source=source, files=len(before), bytes=sum(i["Size"] for i in before),
                 run_id=run_id, mode=mode, source_snapshot=source_snapshot,
                 representative_fit=representative_files(before))
@@ -824,7 +980,7 @@ class SyncRun:
                     args.append("--fast-list")
                 else:
                     args.append("--no-traverse")
-                args += ["--backup-dir", archive, "--max-duration", "20m", "--stats", "30s",
+                args += [*live_options, "--backup-dir", archive, "--max-duration", "20m", "--stats", "30s",
                          *selection, *common]
                 # Every whole-copy retry gets its own archive directory in the controller.
                 args += ["--retries", "1"]
@@ -833,7 +989,8 @@ class SyncRun:
                 elif source_snapshot:
                     log("preview_skipped", run_id=run_id, reason="verified_snapshot")
                 else:
-                    self.runner.run([*args, "--dry-run"], stderr)
+                    self.runner.run([*args, "--dry-run"], stderr,
+                                    **progress_options("preview"))
                     proposed, preview_stats = read_changes(logfile)
                     log("preview_completed", run_id=run_id, proposed_count=len(proposed),
                         proposed_files=list(proposed), stats=preview_stats)
@@ -843,7 +1000,7 @@ class SyncRun:
                         raise CommandFailed("Source inventory changed during preview; retry required")
                     if self.runner.cancellation.is_set() or model_at(Path(source)) != original_device:
                         raise Cancelled("Device disconnected or replaced during preview")
-                self.runner.run(args, stderr)
+                self.runner.run(args, stderr, **progress_options("copy"))
                 changes, stats = read_changes(logfile)
                 copied = len(changes)
                 self.update(copied=copied, copy_completed_at=now(), transfer_stats=stats)
@@ -860,7 +1017,8 @@ class SyncRun:
             check_args = [RCLONE, "check", source, self.destination, "--one-way"]
             if source_snapshot:
                 check_args.append("--fast-list")
-            self.runner.run([*check_args, *selection, *common], stderr)
+            self.runner.run([*check_args, *live_options, "--stats", "30s", *selection, *common],
+                            stderr, **progress_options("verify"))
             if signature(inventory()) != signature(before):
                 raise CommandFailed("Source inventory changed during verification; retry required")
             if self.runner.cancellation.is_set() or model_at(Path(source)) != original_device:
@@ -912,10 +1070,11 @@ class SyncRun:
 
 class Controller:
     """Connection state changes stay on the GLib thread; worker completion returns there."""
-    def __init__(self, state, launch, clock=time.monotonic):
+    def __init__(self, state, launch, clock=time.monotonic, alerts=None):
         self.state = state
         self.launch = launch
         self.clock = clock
+        self.alerts = alerts
         self.source = None
         self.epoch = 0
         self.worker = None
@@ -935,6 +1094,8 @@ class Controller:
             return
         changed = source != self.source or (self.source and disconnected_root == self.source["root"])
         if changed:
+            interrupted = bool(self.source) and source is None and (
+                not self.successful or self.worker is not None)
             self.epoch += 1
             if self.worker:
                 self.worker.cancel()
@@ -948,6 +1109,10 @@ class Controller:
                                verified_connection_token=None,
                               status="connected" if source else "waiting", connection_changed_at=now())
             log("connected" if source else "disconnected", source=source["root"] if source else None)
+            if interrupted and self.alerts:
+                self.alerts.raise_alert(
+                    "usb_disconnected", "The watch disconnected before its backup was verified. "
+                    "Check the cable, connector, and USB port.")
         self.tick()
 
     def request(self, mode):
@@ -983,6 +1148,10 @@ class Controller:
                               retry_after_seconds=delay, retry_at=dt.datetime.fromtimestamp(
                                   time.time() + delay, dt.timezone.utc).isoformat())
             log("run_failed", error=str(error), retry_after_seconds=delay)
+            if self.alerts:
+                self.alerts.raise_alert(
+                    "sync_failed", "Garmin backup failed and will retry: " + str(error),
+                    retry_after_seconds=delay)
         else:
             fields = dict(result or {})
             fields.update(status="connected" if mode == "dry-run" else "success", completed_at=now())
@@ -995,6 +1164,8 @@ class Controller:
                 fields["last_success_details"] = {**result, "source": self.source["root"],
                                                   "completed_at": fields["last_success"]}
             self.state.update(**fields)
+            if mode == "copy" and self.alerts:
+                self.alerts.clear()
         self.tick()
 
     def stop(self):
@@ -1012,6 +1183,7 @@ def daemon(state):
     loop = GLib.MainLoop()
     monitor = Gio.VolumeMonitor.get()
     threads = []
+    alerts = ConnectionAlerts(state)
 
     def launch(source, mode, epoch, complete):
         runner = Runner()
@@ -1019,7 +1191,8 @@ def daemon(state):
 
         def work():
             try:
-                result = SyncRun(state, runner=runner, token=epoch).execute(source["root"], mode)
+                result = SyncRun(state, runner=runner, token=epoch,
+                                 alerts=alerts).execute(source["root"], mode)
                 error = None
             except Exception as exc:
                 result, error = None, exc
@@ -1030,8 +1203,8 @@ def daemon(state):
         thread.start()
         return runner
 
-    controller = Controller(state, launch)
-    usb_health = UsbHealthObserver(state)
+    controller = Controller(state, launch, alerts=alerts)
+    usb_health = UsbHealthObserver(state, alerts=alerts)
 
     def mounts():
         return native_mount_paths(monitor.get_mounts())
@@ -1051,6 +1224,7 @@ def daemon(state):
             state.update(status="blocked", detected=False, source=None,
                          enrolled=True, last_error=str(exc))
             log("discovery_blocked", error=str(exc))
+            alerts.raise_alert("discovery_blocked", str(exc))
             return True
         state.update(enrolled=True)
         usb_health.observe(linux_usb_presence(), bool(source))
@@ -1093,6 +1267,7 @@ def daemon(state):
 
 
 def once(state, mode):
+    alerts = ConnectionAlerts(state) if state else None
     pin = enrolled_device()
     if not pin:
         if state:
@@ -1112,7 +1287,7 @@ def once(state, mode):
             state.update(detected=True, source=display_source, model=source["model"],
                          transport=source.get("transport", "filesystem"))
         source_snapshot = source.get("transport") == "libmtp"
-        result = SyncRun(state, runner=runner).execute(
+        result = SyncRun(state, runner=runner, alerts=alerts).execute(
             source["root"], mode, source_snapshot=source_snapshot)
         if state:
             fields = {**result, "status": "success", "completed_at": now(), "last_error": None}
@@ -1121,6 +1296,8 @@ def once(state, mode):
                 fields["last_success_details"] = {
                     **result, "source": display_source, "completed_at": fields["last_success"]}
             state.update(**fields)
+            if mode == "copy" and alerts:
+                alerts.clear()
         return 0
 
     try:
@@ -1151,6 +1328,8 @@ def once(state, mode):
     except (CommandFailed, Cancelled, OSError, ValueError) as exc:
         if state:
             state.update(status="failed", last_error=str(exc), failed_at=now())
+            if alerts and not isinstance(exc, Cancelled):
+                alerts.raise_alert("sync_failed", "Garmin backup failed: " + str(exc))
         log("run_failed", error=str(exc))
         return 130 if isinstance(exc, Cancelled) else 1
     finally:

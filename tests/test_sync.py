@@ -108,6 +108,86 @@ class ControllerTests(unittest.TestCase):
         self.finish()
         self.assertEqual(len(self.calls), count)
 
+    def test_unverified_disconnect_alerts_once_and_verified_retry_clears_it(self):
+        notices = mock.Mock()
+        alerts = sync.ConnectionAlerts(self.state, notify=notices)
+        control = sync.Controller(self.state, self.control.launch, clock=lambda: self.clock,
+                                  alerts=alerts)
+        self.state.update(enrolled=True)
+        control.observe(DEVICE)
+        first_epoch = control.epoch
+        control.observe(None)
+        alert = self.state.snapshot()["active_alert"]
+        self.assertEqual(alert["code"], "usb_disconnected")
+        self.assertEqual(notices.call_count, 1)
+        alerts.raise_alert("usb_disconnected", alert["message"])
+        self.assertEqual(notices.call_count, 1)
+        control.complete(first_epoch, "copy", error=sync.Cancelled("interrupted"))
+        control.observe(DEVICE)
+        self.assertEqual(self.state.snapshot()["sync_health"]["state"], "degraded")
+        control.complete(control.epoch, "copy", {"considered": 2, "copied": 1,
+                                                  "verified": 2})
+        snapshot = self.state.snapshot()
+        self.assertIsNone(snapshot["active_alert"])
+        self.assertEqual(snapshot["sync_health"]["state"], "synced")
+        self.assertEqual(notices.call_count, 2)
+
+
+class ProgressTests(unittest.TestCase):
+    def test_linux_desktop_alert_dispatches_without_blocking_caller(self):
+        delivered = threading.Event()
+        commands = []
+        def send(command, **_kwargs):
+            commands.append(command)
+            delivered.set()
+            return mock.Mock(returncode=0)
+        with mock.patch.object(sync, "IS_DARWIN", False), \
+             mock.patch.object(sync.shutil, "which", return_value="/usr/bin/notify-send"), \
+             mock.patch.object(sync.subprocess, "run", side_effect=send):
+            sync.desktop_notification("Garmin backup needs attention", "USB disconnected")
+            self.assertTrue(delivered.wait(2))
+        self.assertEqual(commands[0][-2:], ["Garmin backup needs attention",
+                                           "USB disconnected"])
+        self.assertIn("--urgency=critical", commands[0])
+
+    def test_stall_alert_uses_completed_work_and_resets_on_progress(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "rclone.jsonl"
+            path.write_text("")
+            moment = [0.0]
+            stalled = []
+            progress = sync.RcloneProgress(path, stalled.append, clock=lambda: moment[0],
+                                           alert_after=180, abort_after=480)
+            path.write_text(json.dumps({"stats": {"checks": 90, "transfers": 5,
+                                                  "bytes": 1000}}) + "\n")
+            moment[0] = 10
+            self.assertFalse(progress.poll())
+            moment[0] = 190
+            self.assertFalse(progress.poll())
+            self.assertEqual(stalled, [180])
+            moment[0] = 490
+            self.assertTrue(progress.poll())
+            with path.open("a") as handle:
+                handle.write(json.dumps({"stats": {"checks": 91, "transfers": 5,
+                                                   "bytes": 1000}}) + "\n")
+            self.assertFalse(progress.poll())
+            self.assertEqual(stalled, [180])
+
+    def test_stalled_subprocess_terminates_before_general_timeout(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name)
+            log_path = path / "rclone.jsonl"
+            log_path.write_text("")
+            stalled = []
+            started = time.monotonic()
+            with self.assertRaisesRegex(sync.CommandFailed, "made no progress"):
+                sync.Runner().run([sys.executable, "-c", "import time; time.sleep(10)"],
+                                  path / "stderr.log", timeout=5, progress_log=log_path,
+                                  on_stall=stalled.append, stall_alert_after=0.2,
+                                  stall_abort_after=0.6)
+            self.assertEqual(len(stalled), 1)
+            self.assertLess(time.monotonic() - started, 3)
+
 class BasicTests(unittest.TestCase):
     def setUp(self):
         quiet = mock.patch.object(sync, "log")
@@ -500,6 +580,29 @@ OK.
                     {"status": "waiting", "detected": False, "mtp_mount_delayed": True},
                     enrolled=True)["state"], "degraded")
 
+    def test_usb_health_alerts_only_after_mode_or_mount_grace(self):
+        with tempfile.TemporaryDirectory() as name:
+            state = sync.State(Path(name) / "state.json")
+            notices = mock.Mock()
+            alerts = sync.ConnectionAlerts(state, notify=notices)
+            moment = [0.0]
+            observer = sync.UsbHealthObserver(state, clock=lambda: moment[0],
+                                              alerts=alerts)
+            observer.observe("garmin_transient", False)
+            moment[0] = 89
+            observer.observe("garmin_transient", False)
+            self.assertIsNone(state.snapshot().get("active_alert"))
+            moment[0] = 90
+            observer.observe("garmin_transient", False)
+            self.assertEqual(state.snapshot()["active_alert"]["code"], "usb_mode_delayed")
+            observer.observe("garmin_transient", False)
+            self.assertEqual(notices.call_count, 1)
+            observer.observe("fenix_mtp_interface", False)
+            moment[0] = 210
+            observer.observe("fenix_mtp_interface", False)
+            self.assertEqual(state.snapshot()["active_alert"]["code"], "mtp_mount_delayed")
+            self.assertEqual(notices.call_count, 2)
+
     def test_activity_selection_timestamp_and_fallback_provenance(self):
         files = [
             {"Path": "Monitor/latest.fit", "ModTime": "2026-10-12T12:00:00Z"},
@@ -620,6 +723,10 @@ class LocalRcloneTests(unittest.TestCase):
         copies = [args for args in calls if args[1] == "copy"]
         self.assertEqual(len(copies), 2)
         self.assertEqual(copies[0], [*copies[1], "--dry-run"])
+        self.assertIn("--checkers", copies[0])
+        self.assertEqual(copies[0][copies[0].index("--checkers") + 1], "1")
+        self.assertEqual(copies[0][copies[0].index("--transfers") + 1], "1")
+        self.assertTrue(all("--checkers" in args for args in calls if args[1] == "check"))
         self.assertTrue((Path(self.state.snapshot()["log_path"]) / "preview.jsonl").exists())
         self.assertEqual((result["considered"], result["copied"], result["verified"]), (10, 10, 10))
         for path in ("MAP.IMG", "Maps", "mUsIc", "nested/Audio", "SID", "RemoteSW"):
@@ -701,6 +808,7 @@ class LocalRcloneTests(unittest.TestCase):
         self.assertEqual(len(copies), 1)
         self.assertNotIn("--dry-run", copies[0])
         self.assertNotIn("--no-traverse", copies[0])
+        self.assertNotIn("--checkers", copies[0])
         self.assertIn("--fast-list", copies[0])
         self.assertEqual(len(checks), 1)
         self.assertIn("--fast-list", checks[0])

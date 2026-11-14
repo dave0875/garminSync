@@ -212,6 +212,31 @@ be diagnosed by this observer. For physical enumeration failures use
 The daemon never resets USB devices, reads privileged kernel logs, or
 changes the existing enrolled-device verification.
 
+The Linux live MTP copy, preview, and verification use one rclone checker and
+one transfer, instead of rclone's default eight checkers and four transfers.
+This limits simultaneous reads from the watch while retaining checksum
+comparison and the final one-way verification. If completed-file counters stop
+advancing for three minutes, the daemon records a `sync_stalled` event and
+raises an alert. After eight minutes without progress it terminates that rclone
+phase and retries the whole run with the existing bounded backoff. No partial
+run is marked verified.
+
+`garmin-syncctl status` exposes a persistent `sync_health.active_alert`. The
+daemon raises deduplicated alerts for an unverified disconnect, a
+long-lived transient USB mode (90 seconds), a delayed MTP mount (120 seconds),
+a stalled read, or a failed run. It clears the alert only after a verified copy.
+On a desktop it also sends a best-effort notification using `notify-send` on
+Linux or Notification Center on macOS. Journal events and the status alert remain
+available when desktop notifications cannot be delivered. A running service or
+a completed preview is not proof of a backup; look for `sync_health.state` =
+`synced` and `verified_current_connection` = `true`.
+
+The [Garmin fēnix 8 forum](https://forums.garmin.com/outdoor-recreation/outdoor-recreation/f/fenix-8-series/385718/fenix-8-losing-connection-to-garmin-express)
+contains reports of repeated USB disconnects across cables and computers. A
+[Garmin representative explains the watch's USB mode setting](https://forums.garmin.com/outdoor-recreation/outdoor-recreation/f/fenix-8-series/401830/why-i-can-t-use-the-ui-while-charging-f8/1893411).
+The application can detect and report these failures, but a failing physical
+USB link or watch-side MTP mode still needs attention at the watch, cable, or port.
+
 ## Proven activity backup reporting
 
 After a successful `rclone check --one-way` and a final source inventory and
