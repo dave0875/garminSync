@@ -182,6 +182,15 @@ systemctl --user start garmin-sync.service
 existing service `healthy` field. A running service and a previous successful
 run are **not** evidence that a newly connected watch or activity is backed up.
 
+For a short live view, run `garmin-syncctl progress --watch` before or after
+connecting the watch. It prints each phase and rclone's current check, transfer,
+and byte counts as they arrive. It follows automatic retries while the watch
+remains connected and exits after a verified result or disconnection.
+`garmin-syncctl progress` prints one snapshot. The same structured
+`sync_progress` record is available in `garmin-syncctl status`; its step number
+shows phase order, not a time or byte percentage for the whole run. A completed
+preview is labeled separately from a verified backup.
+
 - `waiting_for_device`: no mounted enrolled watch; last success is historical.
 - `connected_unverified`: the watch is visible, but this mount session has no verified copy yet.
 - `syncing`: a copy/verification is active; the backup is not yet proven.
