@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 """Controller regressions and rclone fixtures, using only temporary local backups."""
 import json
+import io
 import os
 from pathlib import Path
 import struct
@@ -61,10 +62,13 @@ class ControllerTests(unittest.TestCase):
     def test_interrupted_stale_completion_and_rapid_reconnect(self):
         self.control.observe(DEVICE)
         epoch = self.control.epoch
+        self.assertEqual(self.state.snapshot()["sync_progress"]["phase"], "detected")
         self.control.observe(None)
         self.assertTrue(self.calls[-1][-1].cancelled)
+        self.assertEqual(self.state.snapshot()["sync_progress"]["phase"], "interrupted")
         self.assertFalse(self.state.update(token=epoch, status="success"))
         self.control.observe(DEVICE)
+        self.assertEqual(self.state.snapshot()["sync_progress"]["phase"], "detected")
         self.assertEqual(len(self.calls), 1)
         self.finish()
         self.assertEqual(len(self.calls), 2)
@@ -75,6 +79,9 @@ class ControllerTests(unittest.TestCase):
             count = len(self.calls)
             self.finish(sync.CommandFailed("fixture failure"))
             self.assertEqual(self.state.snapshot()["retry_after_seconds"], delay)
+            progress = self.state.snapshot()["sync_progress"]
+            self.assertEqual(progress["phase"], "retry_wait")
+            self.assertIn("fixture failure", sync.format_sync_progress(self.state.snapshot()))
             self.clock += delay - 1
             self.control.tick()
             self.assertEqual(len(self.calls), count)
@@ -134,6 +141,25 @@ class ControllerTests(unittest.TestCase):
 
 
 class ProgressTests(unittest.TestCase):
+    def test_progress_watch_waits_for_next_connection_then_finishes(self):
+        snapshots = [
+            {"detected": False, "sync_progress": {"phase": "complete", "verified": 2}},
+            {"detected": True, "sync_progress": {"phase": "detected"}},
+            {"detected": True, "sync_progress": {"phase": "copy", "phase_index": 4,
+                                                   "phase_count": 9, "total_files": 2}},
+            {"detected": True, "sync_progress": {"phase": "complete", "mode": "copy",
+                                                   "verified": 2, "copied": 1}},
+        ]
+        with mock.patch.object(sync, "State", side_effect=[
+                mock.Mock(snapshot=lambda item=item: item) for item in snapshots]), \
+             mock.patch.object(sync.time, "sleep"), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as output:
+            self.assertEqual(sync.main(["progress", "--watch"]), 0)
+        self.assertEqual(output.getvalue().splitlines(), [
+            "Waiting for watch", "Watch detected; preparing sync",
+            "Step 4/9: Copying changed files | 2 selected files",
+            "Sync complete | 2 files verified | 1 file copied"])
+
     def test_linux_desktop_alert_dispatches_without_blocking_caller(self):
         delivered = threading.Event()
         commands = []
@@ -172,6 +198,30 @@ class ProgressTests(unittest.TestCase):
                                                    "bytes": 1000}}) + "\n")
             self.assertFalse(progress.poll())
             self.assertEqual(stalled, [180])
+
+    def test_rclone_progress_publishes_counts_and_deduplicates_stats(self):
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name) / "rclone.jsonl"
+            path.write_text("")
+            updates = []
+            progress = sync.RcloneProgress(path, on_update=updates.append)
+            stats = {"checks": 12, "totalChecks": 40, "transfers": 2,
+                     "totalTransfers": 5, "bytes": 1048576, "totalBytes": 2097152}
+            with path.open("a") as handle:
+                handle.write(json.dumps({"stats": stats}) + "\n")
+            self.assertFalse(progress.poll())
+            self.assertEqual(updates, [stats])
+            with path.open("a") as handle:
+                handle.write(json.dumps({"stats": stats}) + "\n")
+            progress.poll()
+            self.assertEqual(updates, [stats])
+            self.assertEqual(sync.format_sync_progress({"sync_progress": {
+                "phase": "copy", "phase_index": 4, "phase_count": 9,
+                "total_files": 40, "checked": 12, "checks_total": 40,
+                "transferred": 2, "transfers_total": 5,
+                "bytes": 1048576, "bytes_total": 2097152}}),
+                "Step 4/9: Copying changed files | 40 selected files | "
+                "12/40 checked | 2/5 transferred | 1.0 MiB/2.0 MiB")
 
     def test_stalled_subprocess_terminates_before_general_timeout(self):
         with tempfile.TemporaryDirectory() as name:
@@ -310,12 +360,15 @@ OK.
         with tempfile.TemporaryDirectory() as name:
             runner = FakeRunner()
             root = Path(name) / "GARMIN"
+            batches = []
             sync.download_mtp_entries(
-                entries, root, runner, Path(name) / "stderr.log", max_items=1)
+                entries, root, runner, Path(name) / "stderr.log", max_items=1,
+                on_batch=lambda done, total: batches.append((done, total)))
             self.assertEqual((root / "Activity/run.fit").read_bytes(), b"xxx")
             self.assertEqual(
                 (root / "Debug/MetricsBackup/metric.fit").read_bytes(), b"xxxx")
             self.assertEqual(len(runner.calls), 2)
+            self.assertEqual(batches, [(1, 2), (2, 2)])
             self.assertTrue(all(call[0] == sync.MTP_CONNECT for call in runner.calls))
 
     def test_mtp_download_batching_collapses_normal_fenix_inventory(self):
@@ -748,6 +801,24 @@ class LocalRcloneTests(unittest.TestCase):
         self.run_sync()
         self.assertTrue((self.destination / "Activity/activity.fit").exists())
         self.assertTrue((self.destination / "destination-only.fit").exists())
+
+    def test_progress_covers_copy_and_verification_before_success(self):
+        phases = []
+        original_update = self.state.update
+        def record(**fields):
+            if "sync_progress" in fields:
+                phases.append(fields["sync_progress"]["phase"])
+            return original_update(**fields)
+        self.state.update = record
+        result = self.run_sync()
+        self.assertEqual(list(dict.fromkeys(phases)), [
+            "inventory", "preview", "preview_source_check", "copy",
+            "copy_source_check", "verification", "final_check",
+            "fit_inspection", "complete"])
+        progress = self.state.snapshot()["sync_progress"]
+        self.assertEqual(progress["verified"], result["verified"])
+        self.assertEqual(progress["phase_index"], progress["phase_count"])
+        self.assertEqual(progress["total_files"], 10)
     def test_verified_activity_only_promoted_after_successful_checked_copy(self):
         path = "Activity/2026-10-11-08-17-40.fit"
         self.write(path, b"half marathon raw FIT fixture")

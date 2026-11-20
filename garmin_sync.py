@@ -255,7 +255,7 @@ def assess_sync_health(state, enrolled=None, service_ready=None):
         level, reason = "degraded", "Garmin USB interface did not enter MTP mode"
     elif not detected:
         level, reason = "waiting_for_device", "no mounted enrolled Fenix 8; previous success is historical"
-    elif status in ("copy", "verifying", "dry-run"):
+    elif status in ("inventory", "copy", "verifying", "dry-run", "staging"):
         level, reason = "syncing", "current device is being processed; verification pending"
     elif verified_current:
         level, reason = "synced", "current mount session completed a verified copy"
@@ -605,12 +605,13 @@ def _mtp_download_batches(entries, object_root, max_items=1024, arg_budget=96 * 
 
 
 def download_mtp_entries(entries, garmin_root, runner, stderr, max_items=1024,
-                         arg_budget=96 * 1024):
+                         arg_budget=96 * 1024, on_batch=None):
     """Download read-only MTP objects using as few persistent libmtp sessions as practical."""
     garmin_root.mkdir(parents=True, exist_ok=True)
     object_root = private_dir(garmin_root.parent / "objects")
     batches = _mtp_download_batches(entries, object_root, max_items=max_items,
                                     arg_budget=arg_budget)
+    downloaded = 0
     for batch in batches:
         args = [MTP_CONNECT]
         object_paths = {}
@@ -632,11 +633,15 @@ def download_mtp_entries(entries, garmin_root, runner, stderr, max_items=1024,
             destination = garmin_root / item["path"]
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(staged, destination)
+        downloaded += len(batch)
+        if on_batch:
+            on_batch(downloaded, len(entries))
     return len(batches)
 
 
 @contextlib.contextmanager
-def stage_macos_device(expected_identity=None, metadata_only=False, runner=None):
+def stage_macos_device(expected_identity=None, metadata_only=False, runner=None,
+                       on_progress=None):
     """Materialize a verified read-only snapshot of a Fenix MTP filesystem."""
     if not IS_DARWIN:
         raise DiscoveryError("The libmtp staging transport is only used on macOS")
@@ -646,6 +651,8 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
         root = Path(dirname)
         stderr = root / "mtp.stderr.log"
         started = time.monotonic()
+        if on_progress:
+            on_progress("Listing watch files")
         before = mtp_inventory(runner, stderr)
         log("mtp_inventory_completed", files=len(before),
             seconds=round(time.monotonic() - started, 3))
@@ -655,7 +662,13 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
         selected = xml if metadata_only else before
         garmin_root = root / "GARMIN"
         download_started = time.monotonic()
-        sessions = download_mtp_entries(selected, garmin_root, runner, stderr)
+        if on_progress:
+            on_progress("Reading watch files", total_files=len(selected), downloaded=0)
+        sessions = download_mtp_entries(
+            selected, garmin_root, runner, stderr,
+            on_batch=(lambda done, total: on_progress(
+                "Reading watch files", total_files=total, downloaded=done))
+            if on_progress else None)
         log("mtp_download_completed", files=len(selected),
             bytes=sum(item["size"] for item in selected), sessions=sessions,
             seconds=round(time.monotonic() - download_started, 3))
@@ -666,6 +679,9 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
             raise DiscoveryError("Connected fenix 8 is not the enrolled device")
         if not metadata_only:
             reinventory_started = time.monotonic()
+            if on_progress:
+                on_progress("Checking watch file list", total_files=len(before),
+                            downloaded=len(selected))
             after = mtp_inventory(runner, stderr)
             log("mtp_reinventory_completed", files=len(after),
                 seconds=round(time.monotonic() - reinventory_started, 3),
@@ -682,10 +698,11 @@ def stage_macos_device(expected_identity=None, metadata_only=False, runner=None)
 
 class RcloneProgress:
     """Watch completed rclone work, rather than its periodic stats messages."""
-    def __init__(self, path, on_stall, clock=time.monotonic,
+    def __init__(self, path, on_stall=None, on_update=None, clock=time.monotonic,
                  alert_after=180, abort_after=480):
         self.path = Path(path)
         self.on_stall = on_stall
+        self.on_update = on_update
         self.clock = clock
         self.alert_after = alert_after
         self.abort_after = abort_after
@@ -694,6 +711,7 @@ class RcloneProgress:
         self.last_progress = clock()
         self.counters = None
         self.warned = False
+        self.reported = None
 
     def poll(self):
         try:
@@ -724,11 +742,17 @@ class RcloneProgress:
                     self.last_progress = self.clock()
                     self.warned = False
                 self.counters = counters
+                current = tuple(stats.get(key) for key in
+                                ("checks", "totalChecks", "transfers", "totalTransfers",
+                                 "bytes", "totalBytes"))
+                if self.on_update and current != self.reported:
+                    self.reported = current
+                    self.on_update(stats)
         stalled = self.clock() - self.last_progress
-        if stalled >= self.alert_after and not self.warned:
+        if self.on_stall and stalled >= self.alert_after and not self.warned:
             self.warned = True
             self.on_stall(int(stalled))
-        return stalled >= self.abort_after
+        return bool(self.on_stall) and stalled >= self.abort_after
 
 
 class Runner:
@@ -745,14 +769,14 @@ class Runner:
                 os.killpg(proc.pid, signal.SIGTERM)
 
     def run(self, args, stderr_path, timeout=1230, accepted_returncodes=(0,),
-            progress_log=None, on_stall=None, stall_alert_after=180,
+            progress_log=None, on_stall=None, on_update=None, stall_alert_after=180,
             stall_abort_after=480):
         if self.cancellation.is_set():
             raise Cancelled("Connection interrupted")
-        progress = (RcloneProgress(progress_log, on_stall,
+        progress = (RcloneProgress(progress_log, on_stall, on_update,
                                   alert_after=stall_alert_after,
                                   abort_after=stall_abort_after)
-                    if progress_log and on_stall else None)
+                    if progress_log and (on_stall or on_update) else None)
         with open(stderr_path, "ab") as stderr:
             proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=stderr,
                                     start_new_session=True)
@@ -788,6 +812,8 @@ class Runner:
                     action = args[1] if len(args) > 1 else Path(args[0]).name
                     raise CommandFailed(
                         f"{Path(args[0]).name} {action} exited {proc.returncode}; see {stderr_path}")
+                if progress:
+                    progress.poll()
                 return stdout.decode("utf-8")
             finally:
                 with self.lock:
@@ -898,14 +924,68 @@ class SyncRun:
         self.inspector = Path(inspector)
         self.sdk_python = Path(sdk_python)
         self.alerts = alerts
+        self.progress_phases = []
+        self.progress_run_id = None
+        self.progress_started_at = None
+        self.progress_phase = None
 
     def update(self, **fields):
         if self.state:
             self.state.update(token=self.token, **fields)
 
+    def progress(self, phase, **details):
+        self.progress_phase = phase
+        if not self.state:
+            return
+        previous = self.state.snapshot().get("sync_progress") or {}
+        same_phase = previous.get("run_id") == self.progress_run_id and previous.get("phase") == phase
+        entry = ({**previous} if same_phase else {
+            "run_id": self.progress_run_id,
+            "mode": self.progress_mode,
+            "started_at": self.progress_started_at,
+            "phase": phase,
+            "phase_index": self.progress_phases.index(phase) + 1,
+            "phase_count": len(self.progress_phases),
+            "phase_started_at": now(),
+        })
+        entry.update(details)
+        entry["updated_at"] = now()
+        self.update(sync_progress=entry)
+
+    def rclone_progress(self, stats):
+        if not self.state or not self.progress_phase:
+            return
+        names = {"checks": "checked", "totalChecks": "checks_total",
+                 "transfers": "transferred", "totalTransfers": "transfers_total",
+                 "bytes": "bytes", "totalBytes": "bytes_total"}
+        counts = {}
+        for source, target in names.items():
+            try:
+                counts[target] = int(stats[source])
+            except (KeyError, ValueError, TypeError):
+                pass
+        if counts:
+            self.progress(self.progress_phase, **counts)
+
     def execute(self, source, mode="copy", source_snapshot=False):
         private_dir(self.runtime)
         run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex
+        self.progress_run_id = run_id
+        self.progress_mode = mode
+        self.progress_started_at = now()
+        if mode == "dry-run":
+            self.progress_phases = ["inventory", "preview", "preview_source_check", "complete"]
+        elif mode == "verify":
+            self.progress_phases = ["inventory", "verification", "final_check",
+                                    "fit_inspection", "complete"]
+        else:
+            self.progress_phases = ["inventory"]
+            if not source_snapshot:
+                self.progress_phases += ["preview", "preview_source_check"]
+            self.progress_phases += ["copy", "copy_source_check", "verification",
+                                     "final_check", "fit_inspection", "complete"]
+        self.update(status="inventory")
+        self.progress("inventory")
         with tempfile.TemporaryDirectory(prefix="run-", dir=self.runtime) as dirname:
             directory = Path(dirname)
             log_root = (self.state.path.parent if self.state else STATE_PATH.parent) / "runs"
@@ -926,8 +1006,6 @@ class SyncRun:
             live_options = [] if source_snapshot else LIVE_MTP_PARALLELISM
 
             def progress_options(phase):
-                if source_snapshot:
-                    return {}
                 def stalled(seconds):
                     message = (f"Backup made no completed-file progress for {seconds} seconds "
                                f"during {phase}. Check the watch connection and Drive.")
@@ -936,7 +1014,9 @@ class SyncRun:
                     if self.alerts:
                         self.alerts.raise_alert("sync_stalled", message,
                                                 phase=phase, run_id=run_id)
-                return {"progress_log": logfile, "on_stall": stalled}
+                return {"progress_log": logfile,
+                        "on_stall": None if source_snapshot else stalled,
+                        "on_update": self.rclone_progress}
 
             def inventory():
                 result = self.runner.run([RCLONE, "lsjson", source, "-R", "--files-only",
@@ -980,7 +1060,7 @@ class SyncRun:
                     args.append("--fast-list")
                 else:
                     args.append("--no-traverse")
-                args += [*live_options, "--backup-dir", archive, "--max-duration", "20m", "--stats", "30s",
+                args += [*live_options, "--backup-dir", archive, "--max-duration", "20m", "--stats", "5s",
                          *selection, *common]
                 # Every whole-copy retry gets its own archive directory in the controller.
                 args += ["--retries", "1"]
@@ -989,6 +1069,7 @@ class SyncRun:
                 elif source_snapshot:
                     log("preview_skipped", run_id=run_id, reason="verified_snapshot")
                 else:
+                    self.progress("preview", total_files=len(before))
                     self.runner.run([*args, "--dry-run"], stderr,
                                     **progress_options("preview"))
                     proposed, preview_stats = read_changes(logfile)
@@ -996,33 +1077,42 @@ class SyncRun:
                         proposed_files=list(proposed), stats=preview_stats)
                     if logfile.exists():
                         os.replace(logfile, log_directory / "preview.jsonl")
+                    self.progress("preview_source_check", total_files=len(before))
                     if signature(inventory()) != signature(before):
                         raise CommandFailed("Source inventory changed during preview; retry required")
                     if self.runner.cancellation.is_set() or model_at(Path(source)) != original_device:
                         raise Cancelled("Device disconnected or replaced during preview")
+                self.progress("preview" if mode == "dry-run" else "copy",
+                              total_files=len(before))
                 self.runner.run(args, stderr, **progress_options("copy"))
                 changes, stats = read_changes(logfile)
                 copied = len(changes)
                 self.update(copied=copied, copy_completed_at=now(), transfer_stats=stats)
                 log("copy_completed", run_id=run_id, copied=copied,
                     changed_files=list(changes), dry_run=mode == "dry-run", stats=stats)
+                self.progress("preview_source_check" if mode == "dry-run" else
+                              "copy_source_check", total_files=len(before), copied=copied)
                 if signature(inventory()) != signature(before):
                     raise CommandFailed("Source inventory changed during copy; retry required")
             else:
                 copied = 0
             if mode == "dry-run":
+                self.progress("complete", total_files=len(before), copied=copied, verified=0)
                 return {"mode": mode, "considered": len(before), "copied": copied,
                         "verified": 0, "archive": None, "fit_warnings": []}
             self.update(status="verifying")
+            self.progress("verification", total_files=len(before), copied=copied)
             check_args = [RCLONE, "check", source, self.destination, "--one-way"]
             if source_snapshot:
                 check_args.append("--fast-list")
-            self.runner.run([*check_args, *live_options, "--stats", "30s", *selection, *common],
+            self.runner.run([*check_args, *live_options, "--stats", "5s", *selection, *common],
                             stderr, **progress_options("verify"))
+            self.progress("final_check", total_files=len(before), copied=copied)
             if signature(inventory()) != signature(before):
                 raise CommandFailed("Source inventory changed during verification; retry required")
             if self.runner.cancellation.is_set() or model_at(Path(source)) != original_device:
                 raise Cancelled("Device disconnected before completion")
+            self.progress("fit_inspection", total_files=len(before), copied=copied)
             warnings = self.inspect_fits(source, before, stderr) if self.inspect else []
             if self.runner.cancellation.is_set() or model_at(Path(source)) != original_device:
                 raise Cancelled("Device disconnected during FIT inspection")
@@ -1042,6 +1132,8 @@ class SyncRun:
             log("verified", run_id=run_id, files=len(before), copied=copied,
                 activity=activity["relative_path"] if activity else None,
                 fit_warnings=warnings)
+            self.progress("complete", total_files=len(before), copied=copied,
+                          verified=len(before))
             return {"mode": mode, "considered": len(before), "copied": copied,
                     "verified": len(before), "archive": archive if mode == "copy" else None,
                     "fit_warnings": warnings, "verified_at": verified_at,
@@ -1083,9 +1175,13 @@ class Controller:
         self.retry_at = 0
         self.failures = 0
         self.stopping = False
+        old_progress = self.state.snapshot().get("sync_progress") or {}
+        if old_progress.get("phase") not in (None, "complete", "failed", "interrupted"):
+            old_progress = {**old_progress, "phase": "interrupted", "updated_at": now(),
+                            "message": "Sync service restarted before verification"}
         self.state.update(status="waiting", source=None, detected=False,
                           connection_token=0, verified_connection_token=None,
-                           daemon_started_at=now(),
+                           sync_progress=old_progress or None, daemon_started_at=now(),
                           daemon_pid=os.getpid(), build=build_info(),
                           enrolled=bool(enrolled_device()))
 
@@ -1103,10 +1199,23 @@ class Controller:
             self.successful = False
             self.failures = 0
             self.retry_at = 0
+            current_progress = self.state.snapshot().get("sync_progress") or {}
+            if source:
+                progress = {"phase": "detected", "phase_index": 0,
+                            "started_at": now(), "phase_started_at": now(),
+                            "updated_at": now(),
+                            "message": "Watch detected; preparing sync"}
+            elif interrupted:
+                progress = {**current_progress, "phase": "interrupted",
+                            "updated_at": now(),
+                            "message": "Watch disconnected before verification"}
+            else:
+                progress = current_progress or None
             self.state.update(source=source["root"] if source else None,
                               model=source["model"] if source else None,
                               detected=bool(source), connection_token=self.epoch,
                                verified_connection_token=None,
+                              sync_progress=progress,
                               status="connected" if source else "waiting", connection_changed_at=now())
             log("connected" if source else "disconnected", source=source["root"] if source else None)
             if interrupted and self.alerts:
@@ -1144,9 +1253,15 @@ class Controller:
             self.failures += 1
             delay = min(900, 120 * 2 ** min(self.failures - 1, 4))
             self.retry_at = self.clock() + delay
+            progress = self.state.snapshot().get("sync_progress") or {}
+            retry_at = dt.datetime.fromtimestamp(
+                time.time() + delay, dt.timezone.utc).isoformat()
             self.state.update(status="retry_wait", last_error=str(error), failed_at=now(),
-                              retry_after_seconds=delay, retry_at=dt.datetime.fromtimestamp(
-                                  time.time() + delay, dt.timezone.utc).isoformat())
+                              sync_progress={**progress,
+                                             "phase": "retry_wait" if mode == "copy" else "failed",
+                                             "updated_at": now(), "message": str(error),
+                                             "retry_at": retry_at if mode == "copy" else None},
+                              retry_after_seconds=delay, retry_at=retry_at)
             log("run_failed", error=str(error), retry_after_seconds=delay)
             if self.alerts:
                 self.alerts.raise_alert(
@@ -1155,6 +1270,11 @@ class Controller:
         else:
             fields = dict(result or {})
             fields.update(status="connected" if mode == "dry-run" else "success", completed_at=now())
+            progress = self.state.snapshot().get("sync_progress") or {}
+            fields["sync_progress"] = {**progress, "phase": "complete",
+                                       "updated_at": now(),
+                                       "verified": fields.get("verified", 0),
+                                       "copied": fields.get("copied", 0)}
             if mode == "copy":
                 self.successful = True
                 self.failures = 0
@@ -1285,7 +1405,11 @@ def once(state, mode):
         display_source = source.get("display_source", source["root"])
         if state:
             state.update(detected=True, source=display_source, model=source["model"],
-                         transport=source.get("transport", "filesystem"))
+                         transport=source.get("transport", "filesystem"),
+                         sync_progress={"phase": "detected", "phase_index": 0,
+                                        "started_at": now(), "phase_started_at": now(),
+                                        "updated_at": now(),
+                                        "message": "Watch detected; preparing sync"})
         source_snapshot = source.get("transport") == "libmtp"
         result = SyncRun(state, runner=runner, alerts=alerts).execute(
             source["root"], mode, source_snapshot=source_snapshot)
@@ -1302,7 +1426,20 @@ def once(state, mode):
 
     try:
         if IS_DARWIN:
-            with stage_macos_device(pin["identity"], runner=runner) as source:
+            def stage_progress(message, **counts):
+                if state:
+                    progress = state.snapshot().get("sync_progress") or {}
+                    state.update(sync_progress={**progress, "phase": "staging",
+                                                "message": message, "updated_at": now(),
+                                                **counts})
+            if state:
+                state.update(status="staging", detected=True,
+                             sync_progress={"phase": "staging", "phase_index": 0,
+                                            "started_at": now(), "phase_started_at": now(),
+                                            "updated_at": now(),
+                                            "message": "Reading watch over USB/MTP"})
+            with stage_macos_device(pin["identity"], runner=runner,
+                                    on_progress=stage_progress) as source:
                 return execute(source)
 
         try:
@@ -1322,12 +1459,18 @@ def once(state, mode):
     except DiscoveryError as exc:
         if state:
             state.update(status="blocked", detected=False, source=None,
-                         enrolled=True, last_error=str(exc), failed_at=now())
+                         enrolled=True, last_error=str(exc), failed_at=now(),
+                         sync_progress={**(state.snapshot().get("sync_progress") or {}),
+                                        "phase": "failed", "updated_at": now(),
+                                        "message": str(exc)})
         log("discovery_blocked", error=str(exc))
         return 1
     except (CommandFailed, Cancelled, OSError, ValueError) as exc:
         if state:
-            state.update(status="failed", last_error=str(exc), failed_at=now())
+            state.update(status="failed", last_error=str(exc), failed_at=now(),
+                         sync_progress={**(state.snapshot().get("sync_progress") or {}),
+                                        "phase": "failed", "updated_at": now(),
+                                        "message": str(exc)})
             if alerts and not isinstance(exc, Cancelled):
                 alerts.raise_alert("sync_failed", "Garmin backup failed: " + str(exc))
         log("run_failed", error=str(exc))
@@ -1607,6 +1750,86 @@ def macos_watch(state, poll_seconds=5, retry_seconds=120, presence=None, stop_ev
     return 0
 
 
+PROGRESS_LABELS = {
+    "detected": "Watch detected; preparing sync",
+    "staging": "Reading watch over USB/MTP",
+    "inventory": "Inventorying watch files",
+    "preview": "Previewing backup changes",
+    "preview_source_check": "Checking watch after preview",
+    "copy": "Copying changed files",
+    "copy_source_check": "Checking watch after copy",
+    "verification": "Verifying backup against watch",
+    "final_check": "Checking watch and device identity",
+    "fit_inspection": "Inspecting representative FIT files",
+    "complete": "Sync complete",
+    "failed": "Sync failed",
+    "retry_wait": "Sync failed; retry scheduled",
+    "interrupted": "Sync interrupted",
+}
+
+
+def format_sync_progress(state):
+    progress = state.get("sync_progress") or {}
+    phase = progress.get("phase")
+    if not phase:
+        return "Waiting for watch" if not state.get("detected") else "Watch connected; sync pending"
+    label = PROGRESS_LABELS.get(phase, phase.replace("_", " ").capitalize())
+    if phase == "complete" and progress.get("mode") == "dry-run":
+        label = "Preview complete"
+    elif phase == "complete" and progress.get("mode") == "verify":
+        label = "Verification complete"
+    elif phase == "staging" and progress.get("message"):
+        label = progress["message"]
+    index, total = progress.get("phase_index"), progress.get("phase_count")
+    if phase not in ("complete", "failed", "retry_wait", "interrupted") and index and total:
+        label = f"Step {index}/{total}: {label}"
+    parts = [label]
+    if phase in ("failed", "retry_wait", "interrupted") and progress.get("message"):
+        parts.append(progress["message"])
+    if phase == "retry_wait" and progress.get("retry_at"):
+        parts.append(f"retry at {progress['retry_at']}")
+    if phase == "complete":
+        if progress.get("mode") == "dry-run":
+            changes = progress.get("copied", 0)
+            parts.append(f"{changes} proposed {'change' if changes == 1 else 'changes'}")
+        elif progress.get("verified") is not None:
+            verified = progress["verified"]
+            parts.append(f"{verified} {'file' if verified == 1 else 'files'} verified")
+        if progress.get("mode") == "copy" and progress.get("copied") is not None:
+            copied = progress["copied"]
+            parts.append(f"{copied} {'file' if copied == 1 else 'files'} copied")
+    elif phase == "staging":
+        if progress.get("total_files") is not None:
+            parts.append(f"{progress.get('downloaded', 0)}/{progress['total_files']} files read")
+    elif phase not in ("detected", "failed", "retry_wait", "interrupted"):
+        if progress.get("total_files") is not None:
+            total_files = progress["total_files"]
+            parts.append(f"{total_files} selected {'file' if total_files == 1 else 'files'}")
+        for count, total_count, unit in (("checked", "checks_total", "checked"),
+                                         ("transferred", "transfers_total", "transferred")):
+            if progress.get(count) is not None:
+                amount = str(progress[count])
+                if progress.get(total_count):
+                    amount += f"/{progress[total_count]}"
+                if phase == "preview" and count == "transferred":
+                    unit = "proposed transfers"
+                parts.append(f"{amount} {unit}")
+        if progress.get("bytes") or progress.get("bytes_total"):
+            amount = f"{progress['bytes'] / 1048576:.1f} MiB"
+            if progress.get("bytes_total"):
+                amount += f"/{progress['bytes_total'] / 1048576:.1f} MiB"
+            parts.append(amount)
+    if phase not in ("complete", "failed", "retry_wait", "interrupted") and progress.get("phase_started_at"):
+        try:
+            started = dt.datetime.fromisoformat(progress["phase_started_at"])
+            elapsed = int((dt.datetime.now(dt.timezone.utc) - started).total_seconds())
+            if elapsed >= 15:
+                parts.append(f"{(elapsed // 15) * 15}s in this step")
+        except (ValueError, TypeError):
+            pass
+    return " | ".join(parts)
+
+
 def main(argv=None):
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
@@ -1618,9 +1841,32 @@ def main(argv=None):
     single.add_argument("--dry-run", action="store_true")
     for name in ("status", "force", "dry-run", "verify", "doctor", "readiness"):
         commands.add_parser(name)
+    progress_command = commands.add_parser("progress")
+    progress_command.add_argument("--watch", action="store_true",
+                                  help="Follow phase and file counts until this sync ends")
     enrollment = commands.add_parser("enroll")
     enrollment.add_argument("--replace", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "progress":
+        previous = None
+        following = False
+        try:
+            while True:
+                state = State().snapshot()
+                phase = (state.get("sync_progress") or {}).get("phase")
+                if state.get("detected") and phase:
+                    following = True
+                line = ("Waiting for watch" if args.watch and not following and
+                        not state.get("detected") else format_sync_progress(state))
+                if line != previous:
+                    print(line, flush=True)
+                    previous = line
+                if not args.watch or (following and phase in
+                                      ("complete", "failed", "interrupted")):
+                    return 1 if phase in ("failed", "interrupted") else 0
+                time.sleep(1)
+        except KeyboardInterrupt:
+            return 130
     if args.command == "status":
         if IS_DARWIN:
             payload = {
@@ -1636,15 +1882,18 @@ def main(argv=None):
                 payload["enrollment"] and Path(RCLONE).is_file() and
                 all(Path(tool).is_file() for tool in payload["mtp_tools"]))
             payload["last_verified_activity"] = payload["state"].get("last_verified_activity")
+            payload["sync_progress"] = payload["state"].get("sync_progress")
             payload["sync_health"] = assess_sync_health(
                 payload["state"], enrolled=bool(payload["enrollment"]))
             print(json.dumps(payload, indent=2))
             return 0 if payload["healthy"] else 1
         ready, payload = readiness()
-        healthy_states = {"waiting", "connected", "success", "retry_wait", "copy", "verifying", "dry-run"}
+        healthy_states = {"waiting", "connected", "success", "retry_wait", "inventory",
+                          "copy", "verifying", "dry-run", "staging"}
         healthy = ready and bool(payload["enrollment"]) and payload["state"].get("status") in healthy_states
         payload["healthy"] = bool(healthy)
         payload["last_verified_activity"] = payload["state"].get("last_verified_activity")
+        payload["sync_progress"] = payload["state"].get("sync_progress")
         payload["sync_health"] = assess_sync_health(
             payload["state"], enrolled=bool(payload["enrollment"]), service_ready=ready)
         print(json.dumps(payload, indent=2))
