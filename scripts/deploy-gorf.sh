@@ -147,7 +147,10 @@ install_ui_companion() {
   # A self-hosted Actions runner often lacks a GUI bus. The autostart file
   # activates on the next graphical login even if live startup is unavailable.
   if /usr/bin/systemctl --user show-environment | grep -Eq '^(DISPLAY|WAYLAND_DISPLAY)='; then
-    if ! /usr/bin/systemctl --user is-active --quiet garmin-sync-ui.service; then
+    if /usr/bin/systemctl --user is-active --quiet garmin-sync-ui.service; then
+      /usr/bin/systemctl --user restart garmin-sync-ui.service
+      echo "Restarted graphical companion only."
+    else
       /usr/bin/systemd-run --user --unit=garmin-sync-ui --collect \
         --property=Restart=on-failure /usr/bin/python3 "$ui_target" \
         || echo "Live GUI launch unavailable; companion starts on graphical login."

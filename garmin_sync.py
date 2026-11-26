@@ -85,6 +85,8 @@ FILTERS = [
 FINITE = ["--retries", "3", "--low-level-retries", "5", "--timeout", "60s",
           "--contimeout", "15s"]
 LIVE_MTP_PARALLELISM = ["--checkers", "1", "--transfers", "1"]
+LINUX_STAGE_LIMIT = 2 * 1024**3
+LINUX_STAGE_RESERVE = 256 * 1024**2
 
 
 def now():
@@ -824,6 +826,29 @@ def signature(inventory):
     return sorted((item["Path"], item["Size"], item.get("ModTime")) for item in inventory)
 
 
+def checked_md5_manifest(items, expected=None):
+    """Reject missing/duplicate hashes and compare each expected native object."""
+    result = {}
+    for item in items:
+        name = item.get("Path")
+        if expected is not None and name not in expected:
+            continue
+        # rclone versions differ in the casing of the algorithm name.
+        hashes = item.get("Hashes") or {}
+        md5_values = [value for key, value in hashes.items()
+                      if isinstance(key, str) and key.casefold() == "md5"]
+        digest = md5_values[0] if len(md5_values) == 1 else None
+        size = item.get("Size")
+        if (not isinstance(name, str) or name in result
+                or not isinstance(size, int) or size < 0
+                or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{32}", digest)):
+            raise CommandFailed("Missing, invalid or ambiguous MD5 verification evidence")
+        result[name] = (size, digest.lower())
+    if expected is not None and result != expected:
+        raise CommandFailed("Destination content hash inventory differs from staged watch")
+    return result
+
+
 def read_changes(path):
     objects = {}
     stats = {}
@@ -928,12 +953,22 @@ class SyncRun:
         self.progress_run_id = None
         self.progress_started_at = None
         self.progress_phase = None
+        self.phase_monotonic = None
+        self.phase_durations = {}
 
     def update(self, **fields):
         if self.state:
             self.state.update(token=self.token, **fields)
 
     def progress(self, phase, **details):
+        moment = time.monotonic()
+        if phase != self.progress_phase:
+            if self.progress_phase is not None and self.phase_monotonic is not None:
+                elapsed = round(moment - self.phase_monotonic, 3)
+                self.phase_durations[self.progress_phase] = elapsed
+                log("phase_duration", run_id=self.progress_run_id,
+                    phase=self.progress_phase, seconds=elapsed)
+            self.phase_monotonic = moment
         self.progress_phase = phase
         if not self.state:
             return
@@ -949,6 +984,7 @@ class SyncRun:
             "phase_started_at": now(),
         })
         entry.update(details)
+        entry["phase_durations"] = dict(self.phase_durations)
         entry["updated_at"] = now()
         self.update(sync_progress=entry)
 
@@ -967,10 +1003,16 @@ class SyncRun:
         if counts:
             self.progress(self.progress_phase, **counts)
 
-    def execute(self, source, mode="copy", source_snapshot=False):
+    def execute(self, source, mode="copy", source_snapshot=False, linux_snapshot=False):
+        # Explicitly opt-in until GORF real-device benchmark and acceptance.
+        linux_snapshot = bool(linux_snapshot and mode == "copy" and not source_snapshot)
+        live_source = source
         private_dir(self.runtime)
         run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex
         self.progress_run_id = run_id
+        self.progress_phase = None
+        self.phase_monotonic = None
+        self.phase_durations = {}
         self.progress_mode = mode
         self.progress_started_at = now()
         if mode == "dry-run":
@@ -980,14 +1022,16 @@ class SyncRun:
                                     "fit_inspection", "complete"]
         else:
             self.progress_phases = ["inventory"]
-            if not source_snapshot:
+            if linux_snapshot:
+                self.progress_phases += ["staging", "staging_source_check"]
+            elif not source_snapshot:
                 self.progress_phases += ["preview", "preview_source_check"]
             self.progress_phases += ["copy", "copy_source_check", "verification",
                                      "final_check", "fit_inspection", "complete"]
         self.update(status="inventory")
         self.progress("inventory")
-        with tempfile.TemporaryDirectory(prefix="run-", dir=self.runtime) as dirname:
-            directory = Path(dirname)
+        with contextlib.ExitStack() as stack:
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="run-", dir=self.runtime)))
             log_root = (self.state.path.parent if self.state else STATE_PATH.parent) / "runs"
             private_dir(log_root)
             log_directory = private_dir(log_root / run_id)
@@ -1018,9 +1062,13 @@ class SyncRun:
                         "on_stall": None if source_snapshot else stalled,
                         "on_update": self.rclone_progress}
 
-            def inventory():
-                result = self.runner.run([RCLONE, "lsjson", source, "-R", "--files-only",
-                                          *FILTERS, *common], stderr, timeout=300)
+            def inventory(root=None, hashes=False, remote=False):
+                root = source if root is None else root
+                flags = ["--hash", "--hash-type", "MD5"] if hashes else []
+                if remote:
+                    flags.append("--fast-list")
+                result = self.runner.run([RCLONE, "lsjson", root, "-R", "--files-only",
+                                          *flags, *FILTERS, *common], stderr, timeout=300)
                 items = json.loads(result)
                 for item in items:
                     name = item["Path"]
@@ -1043,6 +1091,56 @@ class SyncRun:
                 manifest.write_text("".join(item["Path"] + "\n" for item in before))
                 manifest.chmod(0o600)
                 selection = ["--files-from-raw", str(manifest)]
+            if linux_snapshot:
+                live_before = before
+                live_device = original_device
+                total_bytes = sum(item["Size"] for item in live_before)
+                if total_bytes < 0 or any(item["Size"] < 0 for item in live_before):
+                    raise CommandFailed("Unbounded source file size; staging refused")
+                stage_base = private_dir(log_root.parent / "staging")
+                if (total_bytes > LINUX_STAGE_LIMIT or
+                        shutil.disk_usage(stage_base).free < total_bytes + LINUX_STAGE_RESERVE):
+                    raise CommandFailed("Insufficient bounded private staging space")
+                stage = Path(stack.enter_context(tempfile.TemporaryDirectory(
+                    prefix="capture-", dir=stage_base))) / "GARMIN"
+                stage.mkdir(mode=0o700)
+                stage_log = log_directory / "stage.jsonl"
+                self.update(status="staging")
+                self.progress("staging", total_files=len(live_before), bytes_total=total_bytes)
+                self.runner.run([RCLONE, "copy", live_source, str(stage),
+                                 "--checksum", *LIVE_MTP_PARALLELISM, "--stats", "5s",
+                                 "--max-transfer", "2G", "--cutoff-mode", "HARD",
+                                 *selection, *FINITE, "--retries", "1", "--use-json-log",
+                                 "--log-level", "INFO", "--log-file", str(stage_log)],
+                                stderr, progress_log=stage_log, on_update=self.rclone_progress)
+                self.progress("staging_source_check", total_files=len(live_before))
+                def assert_live_source():
+                    if (self.runner.cancellation.is_set()
+                            or model_at(Path(live_source)) != live_device):
+                        raise Cancelled("Live watch disconnected or identity changed")
+                    if signature(inventory(live_source)) != signature(live_before):
+                        raise CommandFailed("Live watch inventory changed during snapshot run")
+                    if (self.runner.cancellation.is_set()
+                            or model_at(Path(live_source)) != live_device):
+                        raise Cancelled("Live watch disconnected during inventory validation")
+                assert_live_source()
+                staged = inventory(str(stage))
+                if (sorted((item["Path"], item["Size"]) for item in staged) !=
+                        sorted((item["Path"], item["Size"]) for item in live_before)):
+                    raise CommandFailed("Staged inventory differs from original watch")
+                staged_device = model_at(stage)
+                if not staged_device or staged_device["identity"] != live_device["identity"]:
+                    raise Cancelled("Staged device identity differs from live watch")
+                source = str(stage)
+                source_snapshot = True
+                before = staged
+                original_device = staged_device
+                live_options = []
+                # Clear stage/listing log before cloud copy statistics are collected.
+                if logfile.exists():
+                    os.replace(logfile, log_directory / "staging_inventory.jsonl")
+                log("linux_snapshot_ready", run_id=run_id, files=len(before),
+                    bytes=total_bytes)
             archive = self.archive_base.rstrip("/") + "/" + run_id
             self.update(status=mode, considered=len(before), copied=0, verified=0,
                         archive=archive if mode == "copy" else None, run_started_at=now(),
@@ -1105,8 +1203,20 @@ class SyncRun:
             check_args = [RCLONE, "check", source, self.destination, "--one-way"]
             if source_snapshot:
                 check_args.append("--fast-list")
-            self.runner.run([*check_args, *live_options, "--stats", "5s", *selection, *common],
-                            stderr, **progress_options("verify"))
+            if linux_snapshot:
+                # Drive metadata MD5 is independently compared to fresh local bytes.
+                # No size-only fallback for absent hashes and no duplicate expected paths.
+                local_hashes = checked_md5_manifest(inventory(hashes=True))
+                expected_paths = {item["Path"] for item in before}
+                if set(local_hashes) != expected_paths:
+                    raise CommandFailed("Local hash inventory coverage differs from snapshot")
+                checked_md5_manifest(inventory(self.destination, hashes=True, remote=True),
+                                     expected=local_hashes)
+                self.progress("verification", total_files=len(before),
+                              copied=copied, checked=len(before), checks_total=len(before))
+            else:
+                self.runner.run([*check_args, *live_options, "--stats", "5s", *selection, *common],
+                                stderr, **progress_options("verify"))
             self.progress("final_check", total_files=len(before), copied=copied)
             if signature(inventory()) != signature(before):
                 raise CommandFailed("Source inventory changed during verification; retry required")
@@ -1116,6 +1226,9 @@ class SyncRun:
             warnings = self.inspect_fits(source, before, stderr) if self.inspect else []
             if self.runner.cancellation.is_set() or model_at(Path(source)) != original_device:
                 raise Cancelled("Device disconnected during FIT inspection")
+            if linux_snapshot:
+                # Check the live source again before publishing a verified current session.
+                assert_live_source()
             verified_at = now()
             candidate = latest_activity_fit(before)
             activity = None
@@ -1123,7 +1236,8 @@ class SyncRun:
                 activity = {**candidate, "run_id": run_id, "verified_at": verified_at,
                             "destination_path": self.destination.rstrip("/") + "/" +
                             candidate["relative_path"], "mode": mode,
-                            "verification": "rclone_check_one_way_and_source_identity"}
+                            "verification": ("bulk_md5_and_live_source_identity" if linux_snapshot
+                                     else "rclone_check_one_way_and_source_identity")}
                 # Verification-only probes report provenance, but do not promote a new
                 # authoritative copy success in persistent state.
                 if mode == "copy":
@@ -1312,7 +1426,8 @@ def daemon(state):
         def work():
             try:
                 result = SyncRun(state, runner=runner, token=epoch,
-                                 alerts=alerts).execute(source["root"], mode)
+                                 alerts=alerts).execute(source["root"], mode,
+                    linux_snapshot=os.environ.get("GARMIN_SYNC_LINUX_SNAPSHOT") == "1")
                 error = None
             except Exception as exc:
                 result, error = None, exc
@@ -1752,6 +1867,7 @@ def macos_watch(state, poll_seconds=5, retry_seconds=120, presence=None, stop_ev
 
 PROGRESS_LABELS = {
     "detected": "Watch detected; preparing sync",
+    "staging_source_check": "Checking captured watch inventory",
     "staging": "Reading watch over USB/MTP",
     "inventory": "Inventorying watch files",
     "preview": "Previewing backup changes",

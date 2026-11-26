@@ -30,7 +30,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y rclone ripgrep python3-gi shellcheck
+          sudo apt-get install -y rclone ripgrep python3-gi gir1.2-gtk-3.0 xvfb xauth librsvg2-common shellcheck
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
       - name: Static checks
@@ -45,6 +45,8 @@ jobs:
             exit 1
           fi
           /usr/bin/python3 -c "import gi; gi.require_version('Gio','2.0'); from gi.repository import Gio"
+      - name: Synthetic graphical companion render
+        run: xvfb-run -a /usr/bin/python3 garmin_sync_ui.py --smoke-test
       - name: Regression tests
         env:
           PYTHONPATH: ${{ github.workspace }}

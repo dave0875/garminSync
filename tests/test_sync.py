@@ -759,13 +759,15 @@ class LocalRcloneTests(unittest.TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
         return path
-    def run_sync(self, mode="copy", runner=None, inspect=False, source_snapshot=False):
+    def run_sync(self, mode="copy", runner=None, inspect=False, source_snapshot=False,
+                 linux_snapshot=False):
         sdk_python = sync.SDK_PYTHON if sync.SDK_PYTHON.exists() else Path(sys.executable)
         inspector = Path(sync.__file__).resolve().parent / "garmin_fit_inspect.py"
         return sync.SyncRun(self.state, runtime=self.base / "runtime", destination=str(self.destination),
                             archive_base=str(self.archive), runner=runner, inspect=inspect,
                             inspector=inspector, sdk_python=sdk_python).execute(
-                                str(self.source), mode, source_snapshot=source_snapshot)
+                                str(self.source), mode, source_snapshot=source_snapshot,
+                                linux_snapshot=linux_snapshot)
     def test_selection_checksum_idempotence_archive_no_deletion(self):
         calls = []
         class RecordingRunner(sync.Runner):
@@ -886,6 +888,79 @@ class LocalRcloneTests(unittest.TestCase):
         self.assertFalse((Path(self.state.snapshot()["log_path"]) / "preview.jsonl").exists())
         self.assertEqual((result["considered"], result["copied"], result["verified"]), (10, 10, 10))
         self.assertTrue((self.destination / "Debug/MetricsBackup/metrics.fit").exists())
+
+    def test_linux_snapshot_reads_live_inventory_three_times_and_archives_overwrites(self):
+        calls = []
+        class RecordingRunner(sync.Runner):
+            def run(self, args, *positional, **kwargs):
+                calls.append(args)
+                return super().run(args, *positional, **kwargs)
+        result = self.run_sync(runner=RecordingRunner(), linux_snapshot=True)
+        live_calls = [args for args in calls if len(args) > 2 and args[2] == str(self.source)]
+        self.assertEqual([args[1] for args in live_calls], ["lsjson", "copy", "lsjson", "lsjson"])
+        self.assertFalse(any("--dry-run" in args for args in calls))
+        self.assertEqual((result["considered"], result["copied"], result["verified"]), (10, 10, 10))
+        self.assertEqual(list((self.state.path.parent / "staging").iterdir()), [])
+        self.assertIn("staging", self.state.snapshot()["sync_progress"]["phase_durations"])
+        old_file = self.source / "Activity/activity.fit"
+        original = old_file.read_bytes()
+        stamp = old_file.stat()
+        self.write("Activity/activity.fit", b"X" * len(original))
+        os.utime(old_file, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+        (self.destination / "destination-only.fit").write_bytes(b"retain")
+        changed = self.run_sync(linux_snapshot=True)
+        self.assertEqual(changed["copied"], 1)
+        self.assertEqual((Path(changed["archive"]) / "Activity/activity.fit").read_bytes(), original)
+        self.assertEqual((self.destination / "destination-only.fit").read_bytes(), b"retain")
+        self.assertEqual(self.run_sync(linux_snapshot=True)["copied"], 0)
+
+    def test_linux_snapshot_rejects_same_size_destination_corruption(self):
+        outer = self
+        class CorruptingRunner(sync.Runner):
+            def run(self, args, *positional, **kwargs):
+                output = super().run(args, *positional, **kwargs)
+                if args[1] == "copy" and args[3] == str(outer.destination):
+                    target = outer.destination / "Activity/activity.fit"
+                    target.write_bytes(b"Z" * target.stat().st_size)
+                return output
+        with self.assertRaisesRegex(sync.CommandFailed, "hash inventory differs"):
+            self.run_sync(runner=CorruptingRunner(), linux_snapshot=True)
+        self.assertIsNone(self.state.snapshot().get("last_verified_activity"))
+        self.assertEqual(list((self.state.path.parent / "staging").iterdir()), [])
+
+    def test_linux_snapshot_rejects_live_change_after_capture(self):
+        outer = self
+        class ChangingRunner(sync.Runner):
+            def run(self, args, *positional, **kwargs):
+                output = super().run(args, *positional, **kwargs)
+                if args[1] == "copy" and args[2] == str(outer.source):
+                    outer.write("Activity/changed-during-stage.fit", b"changed")
+                return output
+        with self.assertRaisesRegex(sync.CommandFailed, "Live watch inventory changed"):
+            self.run_sync(runner=ChangingRunner(), linux_snapshot=True)
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(list((self.state.path.parent / "staging").iterdir()), [])
+
+    def test_linux_snapshot_rejects_live_change_before_done(self):
+        outer = self
+        class ChangingRunner(sync.Runner):
+            def run(self, args, *positional, **kwargs):
+                output = super().run(args, *positional, **kwargs)
+                if args[1] == "copy" and args[3] == str(outer.destination):
+                    outer.write("Activity/changed-during-upload.fit", b"changed")
+                return output
+        with self.assertRaisesRegex(sync.CommandFailed, "Live watch inventory changed"):
+            self.run_sync(runner=ChangingRunner(), linux_snapshot=True)
+        self.assertIsNone(self.state.snapshot().get("last_verified_activity"))
+
+    def test_bulk_md5_verification_rejects_missing_duplicate_or_wrong_hash(self):
+        good = {"Path": "Activity/test.fit", "Size": 7, "Hashes": {"MD5": "a" * 32}}
+        expected = sync.checked_md5_manifest([good])
+        self.assertEqual(sync.checked_md5_manifest([good], expected), expected)
+        for values in ([], [good, good], [{**good, "Hashes": {}}],
+                       [{**good, "Hashes": {"MD5": "b" * 32}}], [{**good, "Size": 8}]):
+            with self.subTest(values=values), self.assertRaises(sync.CommandFailed):
+                sync.checked_md5_manifest(values, expected)
 
     def test_verified_snapshot_dry_run_is_single_read_only_pass(self):
         calls = []
