@@ -96,6 +96,12 @@ def progress_summary(progress):
             counts.append((str(done) + ("/" + str(total_value) if
                            isinstance(total_value, int) and total_value > 0 else "")
                            + " " + noun))
+    if isinstance(progress.get("bytes"), int) and progress["bytes"] >= 0:
+        amount = f"{progress['bytes'] / 1048576:.1f} MiB"
+        total_bytes = progress.get("bytes_total")
+        if isinstance(total_bytes, int) and total_bytes > 0:
+            amount += f"/{total_bytes / 1048576:.1f} MiB"
+        counts.append(amount)
     if not counts and isinstance(progress.get("total_files"), int):
         counts.append(str(progress["total_files"]) + " files selected")
     index, total = progress.get("phase_index"), progress.get("phase_count")
@@ -139,8 +145,10 @@ def presentation(state, usb):
                 f"{verified} files verified in Google Drive; {copied} transferred this run. "
                 "You may disconnect your watch.", 1.0, False)
     if state.get("status") in ("retry_wait", "failed", "blocked") or phase in ("retry_wait", "failed", "interrupted"):
-        reason = (alert.get("message") or "The backup did not complete. "
-                  "Check the cable and use Retry while the watch is mounted.")
+        # Unfiltered daemon errors may contain private device paths or tokens.
+        # Show only actionable, constant recovery instructions in the GUI.
+        reason = ("The backup was not verified. The daemon may retry automatically. "
+                  "Confirm MTP, cable and USB port; select Retry when mounted.")
         return ("attention", "Backup needs attention", reason, None, mounted)
     if mounted:
         heading, description, fraction = progress_summary(progress)
