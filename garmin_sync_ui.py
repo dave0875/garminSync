@@ -6,7 +6,6 @@ It reads only the daemon's private status JSON and Linux USB identifiers.
 """
 import datetime as dt
 import fcntl
-import math
 import json
 import os
 from pathlib import Path
@@ -293,10 +292,10 @@ def acquire_single_instance(path=LOCK_PATH):
     return fd
 
 
-def launch():
+def launch(smoke=False):
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         print("Garmin Sync UI requires a graphical session; daemon is unaffected.", file=sys.stderr)
-        return 0
+        return 1 if smoke else 0
     try:
         import gi
         gi.require_version("Gtk", "3.0")
@@ -305,8 +304,8 @@ def launch():
         print("Garmin Sync UI needs PyGObject and GTK 3: " + str(exc), file=sys.stderr)
         return 1
 
-    lock_fd = acquire_single_instance()
-    if lock_fd is None:
+    lock_fd = None if smoke else acquire_single_instance()
+    if lock_fd is None and not smoke:
         return 0
 
     class Companion(Gtk.Window):
@@ -323,6 +322,7 @@ def launch():
             self.last_usb = "absent"
             self.session = SessionClock()
             self.first_tick = True
+            self.fixture = ("garmin_transient", {}) if smoke else None
             self.prior_done = None
             self.frame = 0
             self.visual_kind = "waiting"
@@ -396,8 +396,9 @@ def launch():
             self.show_all()
             self.hide()
             self.tick()
-            GLib.timeout_add(1000, self.tick)
-            GLib.timeout_add(160, self.animate)
+            if not smoke:
+                GLib.timeout_add(1000, self.tick)
+                GLib.timeout_add(160, self.animate)
 
         def animate(self):
             if self.get_visible():
@@ -419,7 +420,7 @@ def launch():
             self.hide()
 
         def request_retry(self, *_):
-            if self.last_usb != "fenix_mtp_interface" or not self.last_snapshot.get("mtp_mounted"):
+            if smoke or self.last_usb != "fenix_mtp_interface" or not self.last_snapshot.get("mtp_mounted"):
                 return
             try:
                 subprocess.Popen(
@@ -431,8 +432,7 @@ def launch():
                 self.description.set_text("Could not request sync. Check garmin-sync.service.")
 
         def tick(self):
-            usb = usb_presence()
-            state = read_state()
+            usb, state = self.fixture if smoke else (usb_presence(), read_state())
             self.last_usb, self.last_snapshot = usb, state
             kind, title, message, fraction, can_retry = presentation(state, usb)
             present = usb in ("garmin_transient", "fenix_mtp_interface")
@@ -441,6 +441,8 @@ def launch():
             if kind == "done" and done_key(state) == self.prior_done:
                 kind, title, message, fraction, can_retry = (
                     "connected", "Preparing a new backup", "Waiting for current connection confirmation.", None, False)
+            if kind == "done":
+                self.prior_done = None  # stored separately below for the next physical connection
             restored = recovered_elapsed(state, kind) if self.first_tick and present else 0
             seconds = self.session.update(present, kind, time.monotonic(), restored)
             self.first_tick = False
@@ -495,14 +497,49 @@ def launch():
             if present and not self.dismissed and not self.get_visible():
                 self.show_all()
                 self.retry.set_visible(can_retry)
+            if kind == "done":
+                self.last_completed_key = done_key(state)
+            if not present and self.previous_present:
+                self.prior_done = getattr(self, "last_completed_key", self.prior_done)
             self.previous_present, self.previous_kind = present, kind
             return True
 
-    Companion()
+    window = Companion()
+    if smoke:
+        # Synthetic UI-only fixture. Never read live state/USB or signal the daemon.
+        window.animate()
+        assert window.hero.get_pixbuf() is not None
+        assert "MTP" in window.heading.get_text()
+        state = {
+            "detected": True, "mtp_mounted": True, "source": "synthetic",
+            "status": "copy", "connection_token": 1,
+            "sync_progress": {"phase": "copy", "mode": "copy", "total_files": 942,
+                              "transferred": 15, "transfers_total": 15, "run_id": "synthetic"},
+        }
+        window.fixture = ("fenix_mtp_interface", state)
+        window.tick()
+        window.animate()
+        assert window.indeterminate
+        assert window.metrics[1].get_text() == "15"
+        state.update(status="success", verified_connection_token=1,
+                     last_success_details={"mode": "copy", "considered": 942,
+                                           "copied": 15, "verified": 942})
+        state["sync_progress"].update(phase="complete", verified=942)
+        window.tick()
+        window.animate()
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        assert window.heading.get_text() == "You're all synced!"
+        assert window.metrics[2].get_text() == "942"
+        assert window.bar.get_fraction() == 1.0
+        assert window.get_visible()
+        window.destroy()
+        print("GARMIN_UI_GTK_SMOKE_PASS")
+        return 0
     Gtk.main()
     os.close(lock_fd)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(launch())
+    sys.exit(launch(smoke=sys.argv[1:] == ["--smoke-test"]))
