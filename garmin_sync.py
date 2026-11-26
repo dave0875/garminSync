@@ -1006,6 +1006,9 @@ class SyncRun:
         private_dir(self.runtime)
         run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ") + "-" + uuid.uuid4().hex
         self.progress_run_id = run_id
+        self.progress_phase = None
+        self.phase_monotonic = None
+        self.phase_durations = {}
         self.progress_mode = mode
         self.progress_started_at = now()
         if mode == "dry-run":
@@ -1102,7 +1105,7 @@ class SyncRun:
                 self.progress("staging", total_files=len(live_before), bytes_total=total_bytes)
                 self.runner.run([RCLONE, "copy", live_source, str(stage),
                                  "--checksum", *LIVE_MTP_PARALLELISM, "--stats", "5s",
-                                 "--max-transfer", str(LINUX_STAGE_LIMIT), "--cutoff-mode", "HARD",
+                                 "--max-transfer", "2G", "--cutoff-mode", "HARD",
                                  *selection, *FINITE, "--retries", "1", "--use-json-log",
                                  "--log-level", "INFO", "--log-file", str(stage_log)],
                                 stderr, progress_log=stage_log, on_update=self.rclone_progress)
