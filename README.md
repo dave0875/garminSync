@@ -320,6 +320,75 @@ paths, device identity hashes, rclone credentials, FIT contents, or Drive tokens
 The companion continues to work when its window is hidden; the existing
 headless service is unaffected if GTK or the desktop session is unavailable.
 
+## GORF performance qualification (issue #53)
+
+The Linux snapshot candidate is deliberately **off by default** until measured
+on the enrolled GORF watch. Existing direct checksum-copy/check behavior remains
+the default. The new candidate captures selected files into a private
+temporary directory under `~/.local/state/garmin-sync/staging`, with a
+2 GiB capture cap and free-space reserve. It checks live inventory and
+identity before and after staging and again before publishing verified
+success. It skips the redundant preview of a staged source and compares
+fresh local MD5/size inventory with a bulk-listed destination inventory.
+A missing/invalid hash, duplicate expected path, or mismatch is an error;
+destination-only objects are retained, changed destination objects archived.
+FIT diagnostics run against the local snapshot. Normal failure paths clean up
+the capture; an abrupt power loss or SIGKILL can leave private temporary data,
+which must not be uploaded or reused. No metadata-based persistent hash cache
+is used. Metadata checks cannot detect all concurrent same-size/same-mtime
+changes; the verified result represents captured bytes.
+
+The daemon publishes monotonic `phase_duration` events and per-run
+`sync_progress.phase_durations`. First collect a matched small-delta/no-op
+baseline using the unchanged default. Then, **with the watch disconnected
+and no active backup**, enable the candidate for a controlled hardware test:
+
+```bash
+systemctl --user set-environment GARMIN_SYNC_LINUX_SNAPSHOT=1
+systemctl --user restart garmin-sync.service
+```
+
+Connect the enrolled watch, observe the UI and wait for current-session
+verified Done. Compare the elapsed timer, `considered` / `copied` /
+`verified`, and journal phase timings with a comparable baseline:
+
+```bash
+journalctl --user -u garmin-sync.service -o cat --since today |
+  grep -E '"event": "(phase_duration|linux_snapshot_ready|verified|run_failed)"'
+garmin-syncctl status
+```
+
+Restore the default with the watch disconnected:
+
+```bash
+systemctl --user unset-environment GARMIN_SYNC_LINUX_SNAPSHOT
+systemctl --user restart garmin-sync.service
+```
+
+The candidate is a qualification path, not yet a measured production
+acceleration. Do not enable it permanently until the actual GORF timing,
+Google Drive archive/checksum behavior, and disconnect/retry tests pass.
+
+## Premium GORF graphical companion (issue #52)
+
+The desktop window uses a dark GTK theme, locally generated animated SVG
+watch-to-cloud artwork, a stage timeline, live metrics and an elapsed timer.
+Elapsed time starts at observed USB connection, includes waiting/retries
+during that connection, freezes at verified completion and resets on a new
+physical connection. On a companion restart during a mounted connection,
+the recovered duration is explicitly labeled as elapsed since mount.
+Preview counts describe proposed changes, and dynamically discovered
+copy totals do not masquerade as fixed whole-stage percentages.
+The graphical smoke test is independent of production state:
+
+```bash
+xvfb-run -a /usr/bin/python3 garmin_sync_ui.py --smoke-test
+```
+
+The companion and the backup daemon remain separate processes. If an
+unmanaged autostart instance is still holding the single-instance lock
+after an upgrade, exit/re-enter the graphical session to load the new UI.
+
 ## Operator commands
 
 The commands below are Linux/GORF service operations unless noted. On macOS use
