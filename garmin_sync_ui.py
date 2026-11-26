@@ -128,7 +128,7 @@ def presentation(state, usb):
                 "MTP is available but the watch filesystem has not mounted. "
                 "Unlock the watch if prompted, then reconnect the data cable or try another USB port.",
                 None, False)
-    if usb in ("absent", "unavailable") and not mounted:
+    if usb == "absent" or (usb == "unavailable" and not mounted):
         return ("waiting", "Waiting for Garmin watch",
                 "Connect your watch with a USB data cable. The backup runs automatically.",
                 None, False)
