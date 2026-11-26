@@ -833,7 +833,11 @@ def checked_md5_manifest(items, expected=None):
         name = item.get("Path")
         if expected is not None and name not in expected:
             continue
-        digest = (item.get("Hashes") or {}).get("MD5")
+        # rclone versions differ in the casing of the algorithm name.
+        hashes = item.get("Hashes") or {}
+        md5_values = [value for key, value in hashes.items()
+                      if isinstance(key, str) and key.casefold() == "md5"]
+        digest = md5_values[0] if len(md5_values) == 1 else None
         size = item.get("Size")
         if (not isinstance(name, str) or name in result
                 or not isinstance(size, int) or size < 0
