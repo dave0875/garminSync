@@ -1102,6 +1102,7 @@ class SyncRun:
                 self.progress("staging", total_files=len(live_before), bytes_total=total_bytes)
                 self.runner.run([RCLONE, "copy", live_source, str(stage),
                                  "--checksum", *LIVE_MTP_PARALLELISM, "--stats", "5s",
+                                 "--max-transfer", str(LINUX_STAGE_LIMIT), "--cutoff-mode", "HARD",
                                  *selection, *FINITE, "--retries", "1", "--use-json-log",
                                  "--log-level", "INFO", "--log-file", str(stage_log)],
                                 stderr, progress_log=stage_log, on_update=self.rclone_progress)
@@ -1112,6 +1113,9 @@ class SyncRun:
                         raise Cancelled("Live watch disconnected or identity changed")
                     if signature(inventory(live_source)) != signature(live_before):
                         raise CommandFailed("Live watch inventory changed during snapshot run")
+                    if (self.runner.cancellation.is_set()
+                            or model_at(Path(live_source)) != live_device):
+                        raise Cancelled("Live watch disconnected during inventory validation")
                 assert_live_source()
                 staged = inventory(str(stage))
                 if (sorted((item["Path"], item["Size"]) for item in staged) !=
