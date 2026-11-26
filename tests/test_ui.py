@@ -117,6 +117,22 @@ class CompanionStateTests(unittest.TestCase):
             (watch / "idVendor").write_text("ffff")
             self.assertEqual(ui.usb_presence(root), "absent")
 
+    def test_private_error_details_are_not_shown(self):
+        state = successful_state()
+        state["status"] = "retry_wait"
+        state["sync_progress"]["phase"] = "retry_wait"
+        state["active_alert"] = {
+            "code": "sync_failed",
+            "message": "private:/home/dbarker/.config/rclone/rclone.conf token=sensitive",
+        }
+        message = ui.presentation(state, "fenix_mtp_interface")[2]
+        self.assertNotIn("token=", message)
+        self.assertNotIn("/home/", message)
+
+    def test_absent_usb_overrides_stale_daemon_mount(self):
+        state = successful_state()
+        self.assertEqual(ui.presentation(state, "absent")[0], "waiting")
+
     def test_unplugged_watch_never_reports_done(self):
         state = successful_state()
         state["detected"] = False
