@@ -100,9 +100,54 @@ class CompanionStateTests(unittest.TestCase):
         heading, counts, fraction = ui.progress_summary(progress)
         self.assertIn("Step 4/9", heading)
         self.assertIn("2/8", counts)
-        self.assertEqual(fraction, .25)
+        self.assertIsNone(fraction)  # dynamically discovered transfer totals are not final
         progress["phase"] = "inventory"
         self.assertIsNone(ui.progress_summary(progress)[2])
+
+    def test_preview_reports_proposals_not_completed_uploads(self):
+        progress = {"phase": "preview", "transferred": 15, "transfers_total": 15,
+                    "checked": 350, "checks_total": 900}
+        _, counts, fraction = ui.progress_summary(progress)
+        self.assertIn("proposed changes", counts)
+        self.assertNotIn("files transferred", counts)
+        self.assertIsNone(fraction)
+
+    def test_verification_uses_fixed_inventory_and_does_not_signal_done(self):
+        progress = {"phase": "verification", "checked": 300, "checks_total": 400,
+                    "total_files": 1000}
+        self.assertEqual(ui.progress_summary(progress)[2], .3)
+        progress["checked"] = 1000
+        self.assertEqual(ui.progress_summary(progress)[2], .99)
+
+    def test_session_clock_includes_wait_and_retry_and_freezes_on_done(self):
+        clock = ui.SessionClock()
+        self.assertEqual(clock.update(True, "attention", 100), 0)
+        self.assertEqual(clock.update(True, "syncing", 130), 30)
+        self.assertEqual(clock.update(True, "attention", 160), 60)
+        self.assertEqual(clock.update(True, "done", 220), 120)
+        self.assertEqual(clock.update(True, "done", 250), 120)
+        clock.update(False, "waiting", 260)
+        self.assertEqual(clock.update(True, "attention", 300), 0)
+        self.assertEqual(ui.format_elapsed(3661), "01:01:01")
+
+    def test_clock_restart_recovery_is_labeled(self):
+        clock = ui.SessionClock()
+        self.assertEqual(clock.update(True, "syncing", 100, 45), 45)
+        self.assertTrue(clock.recovered)
+        self.assertEqual(clock.update(True, "done", 120), 65)
+        self.assertEqual(clock.update(False, "waiting", 130), 65)
+
+    def test_artwork_is_valid_svg_in_all_states(self):
+        import xml.etree.ElementTree as ET
+        for kind in ("waiting", "attention", "connected", "syncing", "done"):
+            for frame in (0, 11, 29):
+                root = ET.fromstring(ui.artwork(kind, frame))
+                self.assertTrue(root.tag.endswith("svg"))
+        self.assertNotEqual(ui.artwork("syncing", 0), ui.artwork("syncing", 1))
+
+    def test_done_timeline_only_completed_after_verification(self):
+        self.assertEqual(ui.stage_timeline("done", {"phase": "complete"}), (2, 2, 2, 2, 2))
+        self.assertEqual(ui.stage_timeline("syncing", {"phase": "verification"})[-1], 0)
 
     def test_detects_both_usb_modes_without_watch_access(self):
         with tempfile.TemporaryDirectory() as folder:
