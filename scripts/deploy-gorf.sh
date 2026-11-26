@@ -13,6 +13,10 @@ target_bin="$HOME/.local/bin"
 target_unit="$HOME/.config/systemd/user/garmin-sync.service"
 retired_root="$HOME/.local/bin/garmin-retired"
 autostart_dir="$HOME/.config/autostart"
+ui_source="$repo_root/garmin_sync_ui.py"
+ui_target="$target_root/garmin_sync_ui.py"
+ui_desktop_source="$repo_root/desktop/garmin-sync-ui.desktop"
+ui_desktop_target="$autostart_dir/garmin-sync-ui.desktop"
 
 if [[ "$(id -un)" != "dbarker" || "$(hostname -s | tr '[:lower:]' '[:upper:]')" != "GORF" ]]; then
   echo "Refusing deployment: this script may only run as dbarker on GORF." >&2
@@ -63,11 +67,12 @@ fi
 for required in "$repo_root/garmin_sync.py" "$repo_root/garmin_fit_inspect.py" \
   "$repo_root/bin/garmin-syncctl" "$repo_root/bin/garmin_autodev_sync.sh" \
   "$repo_root/systemd/garmin-sync.service" "$repo_root/requirements.txt" \
+  "$ui_source" "$ui_desktop_source" \
   "$target_root/venv/bin/python3" "$target_root/venv/bin/pip"; do
   [[ -f "$required" ]] || { echo "Missing required file: $required" >&2; exit 66; }
 done
 
-/usr/bin/python3 -m py_compile "$repo_root/garmin_sync.py" "$repo_root/garmin_fit_inspect.py"
+/usr/bin/python3 -m py_compile "$repo_root/garmin_sync.py" "$repo_root/garmin_fit_inspect.py" "$ui_source"
 PYTHONPATH="$repo_root" "$target_root/venv/bin/python3" -m unittest discover -s "$repo_root/tests" -v
 
 expected_sdk="$(sed -n 's/^garmin-fit-sdk==//p' "$repo_root/requirements.txt")"
@@ -115,8 +120,46 @@ fi
 legacy_changed=0
 (( ${#legacy_autostarts[@]} == 0 )) || legacy_changed=1
 
+ui_changed=0
+if different "$ui_source" "$ui_target" || different "$ui_desktop_source" "$ui_desktop_target"; then
+  ui_changed=1
+fi
+
+install_ui_companion() {
+  (( ui_changed )) || return 0
+  # Never restart or signal the native Garmin daemon for a UI-only update.
+  # Fail before installation if the host cannot render the GTK window.
+  /usr/bin/python3 -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk'
+  mkdir -p -- "$target_root" "$autostart_dir" "$retired_root"
+  local stamp backup new_ui new_desktop
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  backup="$retired_root/ui-$stamp"
+  mkdir -m 0700 -- "$backup"
+  [[ ! -e "$ui_target" ]] || cp -p -- "$ui_target" "$backup/garmin_sync_ui.py"
+  [[ ! -e "$ui_desktop_target" ]] || cp -p -- "$ui_desktop_target" "$backup/garmin-sync-ui.desktop"
+  new_ui="$(mktemp "$ui_target.new.XXXXXX")"
+  new_desktop="$(mktemp "$ui_desktop_target.new.XXXXXX")"
+  install -m 0755 -- "$ui_source" "$new_ui"
+  install -m 0644 -- "$ui_desktop_source" "$new_desktop"
+  mv -f -- "$new_ui" "$ui_target"
+  mv -f -- "$new_desktop" "$ui_desktop_target"
+  echo "Installed Garmin GTK companion; graphical-login autostart is enabled."
+  # A self-hosted Actions runner often lacks a GUI bus. The autostart file
+  # activates on the next graphical login even if live startup is unavailable.
+  if /usr/bin/systemctl --user show-environment | grep -Eq '^(DISPLAY|WAYLAND_DISPLAY)='; then
+    if ! /usr/bin/systemctl --user is-active --quiet garmin-sync-ui.service; then
+      /usr/bin/systemd-run --user --unit=garmin-sync-ui --collect \
+        --property=Restart=on-failure /usr/bin/python3 "$ui_target" \
+        || echo "Live GUI launch unavailable; companion starts on graphical login."
+    fi
+  else
+    echo "No GUI display in user manager: companion will start at next desktop login."
+  fi
+}
+
 if (( runtime_changed == 0 && sdk_changed == 0 && legacy_changed == 0 )); then
   echo "No installed Garmin sync runtime change; leaving garmin-sync.service undisturbed."
+  install_ui_companion
   /usr/bin/systemctl --user is-active --quiet garmin-sync.service
   /usr/bin/python3 "$target_root/garmin_sync.py" readiness
   exit 0
@@ -256,5 +299,6 @@ if (( ready == 0 )); then
 fi
 
 GARMIN_SYNC_EXPECT_COMMIT="$commit" /usr/bin/python3 "$target_root/garmin_sync.py" readiness
+install_ui_companion
 rollback_armed=0
 trap - ERR INT TERM
