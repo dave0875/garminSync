@@ -275,6 +275,51 @@ For the Oct 11 half marathon, look for the precise FIT in the successful
 then inspect `garmin-syncctl status`. The actual Drive backup remains
 unconfirmed until such evidence exists.
 
+
+## GORF graphical connection companion (issue #50)
+
+The headless `garmin-sync.service` remains the sole owner of USB file ingestion,
+rclone transfers and verification. A **separate** read-only GTK 3 observer
+(`garmin_sync_ui.py`) starts for `dbarker` at graphical login via
+`~/.config/autostart/garmin-sync-ui.desktop`. It does not require the watch
+to mount before showing the window: Linux USB `091e:0003` triggers an
+immediate **Select MTP** prompt; `091e:51b5` with no mounted filesystem
+shows reconnect and cable guidance. It refreshes daemon transfer/check counts
+once a second and announces **Done** only when the current mounted connection
+completed a verified *copy*, not a dry-run, historical result or partial check.
+
+Required graphical dependencies are system `python3-gi` and
+`gir1.2-gtk-3.0`. GORF deployment checks GTK before installing the UI.
+GUI-only updates install only `garmin_sync_ui.py` and its autostart entry,
+without stopping/restarting the backup service or touching watch/Drive files.
+The deployer attempts an immediate desktop startup when the user-systemd
+manager exposes `DISPLAY` or `WAYLAND_DISPLAY`; otherwise it starts on
+the next graphical login. A hidden companion keeps watching for new USB events
+and reappears on a physical reconnect or verified completion.
+
+Operator checks on GORF:
+
+```bash
+systemctl --user status garmin-sync.service
+test -f ~/.config/autostart/garmin-sync-ui.desktop
+/usr/bin/python3 -c 'import gi; gi.require_version("Gtk", "3.0"); from gi.repository import Gtk'
+pgrep -af garmin_sync_ui.py
+garmin-syncctl status
+```
+
+If the graphical session is active but the companion has not started,
+run `/usr/bin/python3 ~/.local/bin/garmin-sync/garmin_sync_ui.py`
+from a terminal **inside that graphical desktop**. It uses a process lock,
+so an existing copy remains the only instance. The **Retry sync** button sends
+SIGUSR1 to the existing daemon only when MTP is mounted; it never starts a
+parallel transfer. Closing the window hides it until the next USB connection
+or actionable/verified state transition.
+
+The desktop component intentionally does **not** display local Garmin file
+paths, device identity hashes, rclone credentials, FIT contents, or Drive tokens.
+The companion continues to work when its window is hidden; the existing
+headless service is unaffected if GTK or the desktop session is unavailable.
+
 ## Operator commands
 
 The commands below are Linux/GORF service operations unless noted. On macOS use

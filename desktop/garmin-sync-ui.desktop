@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Garmin Sync
+GenericName=Garmin Sync connection and backup status
+Comment=Watch connection, recovery tips, transfer progress and verified backup status
+Exec=/usr/bin/python3 /home/dbarker/.local/bin/garmin-sync/garmin_sync_ui.py
+Icon=drive-removable-media
+Terminal=false
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
+Hidden=false
